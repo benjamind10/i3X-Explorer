@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useSubscriptionsStore } from '../../stores/subscriptions'
 import { useConnectionStore } from '../../stores/connection'
-import { getClient, type I3XClient } from '../../api/client'
+import { getClient, isAbortError, isCurrentClient, type I3XClient } from '../../api/client'
 import { SSESubscription, PollingSubscription, HttpStatusError, isSubscriptionGoneError } from '../../api/subscription'
 import { TrendView } from './TrendView'
 import type { SyncResponseItem } from '../../api/types'
@@ -46,7 +46,8 @@ export function SubscriptionPanel() {
     }
   }, [isConnected, clearAll])
 
-  const handleDataUpdate = (items: SyncResponseItem[]) => {
+  const handleDataUpdate = (client: I3XClient, items: SyncResponseItem[]) => {
+    if (!isCurrentClient(client)) return
     recoveryAttemptsRef.current = 0
     items.forEach((item) => {
       updateLiveValue({
@@ -60,9 +61,8 @@ export function SubscriptionPanel() {
     })
   }
 
-  const handleRecovery = async (oldSubscriptionId: string) => {
-    const client = getClient()
-    if (!client) return
+  const handleRecovery = async (oldSubscriptionId: string, client: I3XClient) => {
+    if (!isCurrentClient(client)) return
 
     if (recoveryAttemptsRef.current >= 3) {
       console.warn(`Subscription ${oldSubscriptionId} recovery aborted after 3 attempts`)
@@ -83,11 +83,20 @@ export function SubscriptionPanel() {
     // Best-effort delete on the server — the subscription is likely already gone (404/410)
     // but this cleans up the clientId entry from the client-side map.
     try { await client.deleteSubscription(oldSubscriptionId) } catch { /* already gone */ }
+    if (!isCurrentClient(client)) return
 
     try {
       const { subscriptionId: newId } = await client.createSubscription()
+      if (!isCurrentClient(client)) {
+        void client.deleteSubscription(newId).catch(() => {})
+        return
+      }
       if (monitoredItems.length > 0) {
         await client.registerMonitoredItems(newId, monitoredItems)
+        if (!isCurrentClient(client)) {
+          void client.deleteSubscription(newId).catch(() => {})
+          return
+        }
       }
       addSubscription({
         id: newId,
@@ -96,9 +105,11 @@ export function SubscriptionPanel() {
         isStreaming: false
       })
       setActiveSubscription(newId)
-      await handleStartStream(newId)
+      await handleStartStream(newId, client)
     } catch (err) {
-      console.error('Subscription recovery failed:', err)
+      if (isCurrentClient(client) && !isAbortError(err)) {
+        console.error('Subscription recovery failed:', err)
+      }
     }
   }
 
@@ -111,10 +122,11 @@ export function SubscriptionPanel() {
     // Use polling (QoS2) - more reliable, works with CORS
     pollingRef.current = new PollingSubscription(
       () => client.sync(subscriptionId),
-      handleDataUpdate,
+      items => handleDataUpdate(client, items),
       (error) => {
+        if (!isCurrentClient(client) || isAbortError(error)) return
         if (isSubscriptionGoneError(error)) {
-          handleRecovery(subscriptionId)
+          void handleRecovery(subscriptionId, client)
         } else {
           console.error('Polling error:', error)
           setStreaming(subscriptionId, false)
@@ -125,9 +137,9 @@ export function SubscriptionPanel() {
     pollingRef.current.start()
   }
 
-  const handleStartStream = async (subscriptionId: string) => {
-    const client = getClient()
-    if (!client) return
+  const handleStartStream = async (subscriptionId: string, capturedClient?: I3XClient) => {
+    const client = capturedClient ?? getClient()
+    if (!client || !isCurrentClient(client)) return
 
     // Disconnect existing connections
     sseRef.current?.disconnect()
@@ -144,10 +156,11 @@ export function SubscriptionPanel() {
       const streamConfig = client.getStreamConfig(subscriptionId)
       sseRef.current = new SSESubscription(
         streamConfig.url,
-        handleDataUpdate,
+        items => handleDataUpdate(client, items),
         (error) => {
+          if (!isCurrentClient(client) || isAbortError(error)) return
           if (isSubscriptionGoneError(error)) {
-            handleRecovery(subscriptionId)
+            void handleRecovery(subscriptionId, client)
           } else if (isRelease && error instanceof HttpStatusError && error.status === 501) {
             // 1.0: 501 = streaming permanently unsupported — fall back to polling
             console.warn('Server does not support SSE streaming (HTTP 501), falling back to polling')
@@ -166,7 +179,7 @@ export function SubscriptionPanel() {
       sseRef.current.connect()
     }
 
-    setStreaming(subscriptionId, true)
+    if (isCurrentClient(client)) setStreaming(subscriptionId, true)
   }
 
   const handleStopStream = (subscriptionId: string) => {

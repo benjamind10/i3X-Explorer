@@ -1,4 +1,4 @@
-import type { I3XClient } from '../../api/client'
+import { isCurrentClient, type I3XClient } from '../../api/client'
 import { useExplorerStore } from '../../stores/explorer'
 import type { ObjectInstance } from '../../api/types'
 
@@ -56,20 +56,50 @@ export async function resolveCompositionFlags(client: I3XClient, loaded: ObjectI
 const ALL_OBJECTS_REFETCH_TTL_MS = 3000
 let allObjectsFetchedAt = 0
 let allObjectsInFlight: Promise<void> | null = null
+let allObjectsInFlightOwner: I3XClient | null = null
+const treeRequestGenerations = new Map<string, number>()
+
+export function beginTreeRequest(key: string): number {
+  const generation = (treeRequestGenerations.get(key) ?? 0) + 1
+  treeRequestGenerations.set(key, generation)
+  return generation
+}
+
+export function isLatestTreeRequest(key: string, generation: number): boolean {
+  return treeRequestGenerations.get(key) === generation
+}
+
+export function invalidateTreeRequest(key: string): void {
+  beginTreeRequest(key)
+}
+
+export function resetTreeRefreshState(): void {
+  allObjectsFetchedAt = 0
+  allObjectsInFlight = null
+  allObjectsInFlightOwner = null
+  treeRequestGenerations.clear()
+}
 
 export async function refreshAllObjects(client: I3XClient, force = false): Promise<void> {
-  if (allObjectsInFlight) return allObjectsInFlight
+  if (allObjectsInFlight && allObjectsInFlightOwner === client) return allObjectsInFlight
   if (!force && Date.now() - allObjectsFetchedAt < ALL_OBJECTS_REFETCH_TTL_MS) return
-  allObjectsInFlight = (async () => {
+  let promise!: Promise<void>
+  promise = (async () => {
     try {
       const objects = await client.getObjects()
+      if (!isCurrentClient(client)) return
       useExplorerStore.getState().setAllObjects(objects)
       allObjectsFetchedAt = Date.now()
     } finally {
-      allObjectsInFlight = null
+      if (allObjectsInFlight === promise) {
+        allObjectsInFlight = null
+        allObjectsInFlightOwner = null
+      }
     }
   })()
-  return allObjectsInFlight
+  allObjectsInFlight = promise
+  allObjectsInFlightOwner = client
+  return promise
 }
 
 // Chevron predicate: consult the compositionCache, which holds the actual child

@@ -75,3 +75,6 @@ scripts/i3x-explorer-web.service
 config.local.json
 demo/boiler.html
 .claude/
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/

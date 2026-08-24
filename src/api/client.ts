@@ -85,6 +85,8 @@ export interface StreamConfig {
 }
 
 export class I3XClient {
+  private readonly abortController = new AbortController()
+  private retired = false
   private baseUrl: string
   private credentials: ClientCredentials | null
   private apiVersion: ApiVersion = 'v0'
@@ -114,6 +116,19 @@ export class I3XClient {
 
   getCapabilities(): ServerCapabilities | null {
     return this.capabilities
+  }
+
+  retire(): void {
+    this.retired = true
+  }
+
+  dispose(): void {
+    this.retire()
+    this.abortController.abort()
+  }
+
+  isRetired(): boolean {
+    return this.retired || this.abortController.signal.aborted
   }
 
   // True for v1-beta and v1 (Release) — any server that speaks the v1 wire format
@@ -152,8 +167,12 @@ export class I3XClient {
 
     Object.assign(headers, buildAuthHeaders(this.credentials));
 
-    const options: RequestInit = { method, headers }
-    if (body) {
+    const options: RequestInit = {
+      method,
+      headers,
+      signal: this.abortController.signal
+    }
+    if (body !== undefined) {
       options.body = JSON.stringify(body)
     }
 
@@ -215,7 +234,11 @@ export class I3XClient {
       const headers: Record<string, string> = { 'Accept': 'application/json' }
       Object.assign(headers, buildAuthHeaders(this.credentials));
 
-      const response = await fetch(url, { method: 'GET', headers })
+      const response = await fetch(url, {
+        method: 'GET',
+        headers,
+        signal: this.abortController.signal
+      })
 
       // If the server redirected (e.g. http → https upgrade), adopt the final URL
       // for all subsequent requests. GETs survive a 301/302 redirect but browsers
@@ -677,10 +700,21 @@ export function getClient(): I3XClient | null {
 }
 
 export function createClient(baseUrl: string, credentials?: ClientCredentials | null): I3XClient {
+  clientInstance?.dispose()
   clientInstance = new I3XClient(baseUrl, credentials)
   return clientInstance
 }
 
 export function destroyClient(): void {
+  const client = clientInstance
   clientInstance = null
+  client?.dispose()
+}
+
+export function isCurrentClient(client: I3XClient): boolean {
+  return clientInstance === client && !client.isRetired()
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
 }

@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { useConnectionStore } from '../../stores/connection'
 import type { Credentials } from '../../stores/connection'
+import { getClient } from '../../api/client'
+import { cleanupCurrentSession, credentialsEqual, normalizeServerUrl } from '../../sessionLifecycle'
 
 const isElectron = typeof window !== 'undefined' && !!window.electronAPI
 
@@ -37,8 +39,7 @@ export function ConnectionDialog() {
   const [headerName, setHeaderName] = useState(savedCreds?.type === 'header' ? savedCreds.headerName : '')
   const [headerValue, setHeaderValue] = useState(savedCreds?.type === 'header' ? savedCreds.headerValue : '')
 
-  const handleSave = () => {
-    setServerUrl(inputUrl)
+  const buildCredentialsFromForm = (): Credentials | null => {
     let newCredentials: Credentials | null = null
     if (authMethod === 'basic' && username) {
       newCredentials = { type: 'basic', username, password }
@@ -47,6 +48,19 @@ export function ConnectionDialog() {
     } else if (authMethod === 'header' && headerName && headerValue) {
       newCredentials = { type: 'header', headerName: headerName.trim(), headerValue }
     }
+    return newCredentials
+  }
+
+  const handleSave = () => {
+    const newCredentials = buildCredentialsFromForm()
+    const activeClient = getClient()
+    const settingsChanged = activeClient && (
+      normalizeServerUrl(inputUrl) !== activeClient.getBaseUrl() ||
+      !credentialsEqual(newCredentials, activeClient.getCredentials())
+    )
+
+    if (settingsChanged) cleanupCurrentSession()
+    setServerUrl(inputUrl)
     setCredentials(newCredentials)
     saveCredentialsForUrl(inputUrl, newCredentials)
     setIgnoreCertErrors(ignoreCertErrors)

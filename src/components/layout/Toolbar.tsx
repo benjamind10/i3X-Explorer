@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useConnectionStore } from '../../stores/connection'
 import { useExplorerStore } from '../../stores/explorer'
-import { useSubscriptionsStore } from '../../stores/subscriptions'
-import { createClient, destroyClient, getClient, type ApiVersion } from '../../api/client'
+import { createClient, isAbortError, isCurrentClient, type ApiVersion } from '../../api/client'
+import { cleanupCurrentSession } from '../../sessionLifecycle'
 import { SearchModal } from '../search/SearchModal'
 import iconPng from '/icon.png'
 
@@ -50,11 +50,16 @@ export function Toolbar() {
     setConnecting,
     setError,
     addRecentUrl,
-    disconnect: disconnectStore
   } = useConnectionStore()
 
-  const { setNamespaces, setObjectTypes, setAllObjects, setHierarchicalRoots, setLoading, reset: resetExplorer, pollIntervalMs, setPollIntervalMs, triggerManualRefresh, sidebarCollapsed, toggleSidebar } = useExplorerStore()
-  const { clearAll: clearSubscriptions } = useSubscriptionsStore()
+  const { setNamespaces, setObjectTypes, setAllObjects, setHierarchicalRoots, setLoading, pollIntervalMs, setPollIntervalMs, triggerManualRefresh, sidebarCollapsed, toggleSidebar } = useExplorerStore()
+
+  useEffect(() => {
+    if (!isConnected) {
+      setApiVersion(null)
+      setRedirectNotice(null)
+    }
+  }, [isConnected])
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -68,84 +73,65 @@ export function Toolbar() {
   }, [isConnected])
 
   const handleConnect = async () => {
+    const targetUrl = serverUrl
+    const activeCredentials = credentials ?? getCredentialsForUrl(targetUrl)
+
+    cleanupCurrentSession()
+    setCredentials(activeCredentials)
     setConnecting(true)
     setError(null)
     setRedirectNotice(null)
 
-    // Use saved credentials if none are currently set
-    const activeCredentials = credentials ?? getCredentialsForUrl(serverUrl)
-    if (activeCredentials && !credentials) {
-      setCredentials(activeCredentials)
-    }
-
+    const client = createClient(targetUrl, activeCredentials)
     try {
-      const client = createClient(serverUrl, activeCredentials)
       const success = await client.testConnection()
+      if (!isCurrentClient(client)) return
 
-      if (success) {
-        const detectedVersion = client.getApiVersion()
-        if (detectedVersion === 'v0') {
-          destroyClient()
-          setConnecting(false)
-          setShowV0Blocked(true)
-          return
-        }
-        setConnected(true)
-        setApiVersion(detectedVersion)
-
-        // The server may have redirected during version detection (e.g. http → https);
-        // the client adopted the final URL. Sync it back to the store so the toolbar
-        // shows the real URL, future connects skip the redirect, and saved credentials
-        // follow the new URL. Compare against the trailing-slash-stripped input since
-        // the client constructor strips it too.
-        const finalUrl = client.getBaseUrl()
-        if (finalUrl !== serverUrl.replace(/\/$/, '')) {
-          setServerUrl(finalUrl)
-          if (activeCredentials) {
-            saveCredentialsForUrl(finalUrl, activeCredentials)
-          }
-          setRedirectNotice({ from: serverUrl, to: finalUrl })
-        }
-        addRecentUrl(finalUrl)
-
-        // Load initial data
-        setLoading(true)
-        const [namespaces, objectTypes] = await Promise.all([
-          client.getNamespaces(),
-          client.getObjectTypes()
-        ])
-        setNamespaces(namespaces)
-        setObjectTypes(objectTypes)
-        setLoading(false)
-
-        // Fire-and-forget: prefetch flat object list + hierarchy roots so the
-        // tree's [count] indicators show before the user expands those folders.
-        // Doesn't block the connect flow; expansion later refetches with
-        // composition resolution, so chevron accuracy isn't affected.
-        client.getObjects().then(setAllObjects).catch(() => {})
-        client.getObjects(undefined, false, true).then(setHierarchicalRoots).catch(() => {})
-      } else {
-        setError('Failed to connect to server')
-        destroyClient()
+      if (!success) throw new Error('Failed to connect to server')
+      const detectedVersion = client.getApiVersion()
+      if (detectedVersion === 'v0') {
+        cleanupCurrentSession()
+        setShowV0Blocked(true)
+        return
       }
-    } catch (err) {
+      setConnected(true)
+      setApiVersion(detectedVersion)
+
+      const finalUrl = client.getBaseUrl()
+      if (finalUrl !== targetUrl.replace(/\/$/, '')) {
+        setServerUrl(finalUrl)
+        if (activeCredentials) {
+          saveCredentialsForUrl(finalUrl, activeCredentials)
+        }
+        setRedirectNotice({ from: targetUrl, to: finalUrl })
+      }
+      addRecentUrl(finalUrl)
+
+      setLoading(true)
+      const [namespaces, objectTypes] = await Promise.all([
+        client.getNamespaces(),
+        client.getObjectTypes()
+      ])
+      if (!isCurrentClient(client)) return
+      setNamespaces(namespaces)
+      setObjectTypes(objectTypes)
       setLoading(false)
+
+      void client.getObjects()
+        .then(objects => { if (isCurrentClient(client)) setAllObjects(objects) })
+        .catch(error => { if (!isAbortError(error)) console.error(error) })
+      void client.getObjects(undefined, false, true)
+        .then(roots => { if (isCurrentClient(client)) setHierarchicalRoots(roots) })
+        .catch(error => { if (!isAbortError(error)) console.error(error) })
+    } catch (err) {
+      if (!isCurrentClient(client) || isAbortError(err)) return
+      cleanupCurrentSession()
       setError(err instanceof Error ? err.message : 'Connection failed')
-      destroyClient()
     }
   }
 
-  const handleDisconnect = async () => {
-    const client = getClient()
-    if (client) {
-      const ids = Array.from(useSubscriptionsStore.getState().subscriptions.keys())
-      await Promise.allSettled(ids.map(id => client.deleteSubscription(id)))
-    }
-
-    destroyClient()
-    disconnectStore()
-    resetExplorer()
-    clearSubscriptions()
+  const handleDisconnect = () => {
+    cleanupCurrentSession()
     setApiVersion(null)
     setRedirectNotice(null)
   }

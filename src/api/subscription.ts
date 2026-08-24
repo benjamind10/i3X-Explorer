@@ -57,6 +57,8 @@ export class SSESubscription {
   private maxReconnectAttempts = 5
   private reconnectDelay = 1000
   private connected = false
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
+  private generation = 0
 
   constructor(
     url: string,
@@ -84,11 +86,12 @@ export class SSESubscription {
 
   connect(): void {
     this.disconnect()
+    const generation = ++this.generation
     this.abortController = new AbortController()
-    this.startFetch()
+    void this.startFetch(generation)
   }
 
-  private async startFetch(): Promise<void> {
+  private async startFetch(generation: number): Promise<void> {
     const headers: Record<string, string> = {
       'Accept': 'text/event-stream'
     }
@@ -112,7 +115,7 @@ export class SSESubscription {
         // 404/410 means the subscription is gone — retrying will always fail.
         // failFastStatuses (e.g. 501 = streaming unsupported) are equally permanent.
         if (response.status === 404 || response.status === 410 || this.failFastStatuses.includes(response.status)) {
-          this.onError(err)
+          if (generation === this.generation) this.onError(err)
           return
         }
         throw err
@@ -123,6 +126,7 @@ export class SSESubscription {
       }
 
       console.log('SSE connection opened')
+      if (generation !== this.generation) return
       this.connected = true
       this.reconnectAttempts = 0
 
@@ -142,27 +146,30 @@ export class SSESubscription {
           if (line.startsWith('data: ')) {
             const dataStr = line.slice(6)
             if (dataStr.trim()) {
-              this.processMessage(dataStr)
+              this.processMessage(dataStr, generation)
             }
           }
         }
       }
 
       // Stream ended normally
+      if (generation !== this.generation) return
       this.connected = false
-      this.handleDisconnect()
+      this.handleDisconnect(generation)
     } catch (err) {
+      if (generation !== this.generation) return
       this.connected = false
       if (err instanceof Error && err.name === 'AbortError') {
         // Intentional disconnect, don't reconnect
         return
       }
       console.error('SSE error:', err)
-      this.handleDisconnect()
+      this.handleDisconnect(generation)
     }
   }
 
-  private processMessage(dataStr: string): void {
+  private processMessage(dataStr: string, generation: number): void {
+    if (generation !== this.generation) return
     try {
       const rawData = JSON.parse(dataStr) as Array<Record<string, unknown>>
       const items: SyncResponseItem[] = []
@@ -203,7 +210,7 @@ export class SSESubscription {
           }
         }
       }
-      if (items.length > 0) {
+      if (items.length > 0 && generation === this.generation) {
         this.onData(items)
       }
     } catch (err) {
@@ -211,22 +218,30 @@ export class SSESubscription {
     }
   }
 
-  private handleDisconnect(): void {
+  private handleDisconnect(generation: number): void {
+    if (generation !== this.generation) return
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++
       const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1)
       console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`)
 
-      setTimeout(() => {
+      this.reconnectTimeout = setTimeout(() => {
+        if (generation !== this.generation) return
+        this.reconnectTimeout = null
         this.abortController = new AbortController()
-        this.startFetch()
+        void this.startFetch(generation)
       }, delay)
     } else {
-      this.onError(new Error('Max reconnection attempts reached'))
+      if (generation === this.generation) {
+        this.onError(new Error('Max reconnection attempts reached'))
+      }
     }
   }
 
   disconnect(): void {
+    this.generation++
+    if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout)
+    this.reconnectTimeout = null
     if (this.abortController) {
       this.abortController.abort()
       this.abortController = null
@@ -247,6 +262,7 @@ export class PollingSubscription {
   private onData: SubscriptionCallback
   private onError: ErrorCallback
   private pollInterval: number
+  private generation = 0
 
   constructor(
     syncFn: () => Promise<SyncResponseItem[]>,
@@ -262,22 +278,27 @@ export class PollingSubscription {
 
   start(): void {
     this.stop()
-    this.poll() // Initial poll
-    this.intervalId = setInterval(() => this.poll(), this.pollInterval)
+    const generation = ++this.generation
+    void this.poll(generation) // Initial poll
+    this.intervalId = setInterval(() => void this.poll(generation), this.pollInterval)
   }
 
-  private async poll(): Promise<void> {
+  private async poll(generation: number): Promise<void> {
     try {
       const items = await this.syncFn()
+      if (generation !== this.generation) return
       if (items.length > 0) {
         this.onData(items)
       }
     } catch (err) {
-      this.onError(err instanceof Error ? err : new Error(String(err)))
+      if (generation === this.generation) {
+        this.onError(err instanceof Error ? err : new Error(String(err)))
+      }
     }
   }
 
   stop(): void {
+    this.generation++
     if (this.intervalId) {
       clearInterval(this.intervalId)
       this.intervalId = null
