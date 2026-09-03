@@ -3,6 +3,8 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { useExplorerStore } from '../../stores/explorer'
 import { getClient } from '../../api/client'
 import type { ObjectInstance } from '../../api/types'
+import { useConnectionStore } from '../../stores/connection'
+import { captureSession } from '../../session'
 import { TreeNode } from './TreeNode'
 import { flattenObjectForest, resolveCompositionFlags, getObjectLabel, ESTIMATED_ROW_HEIGHT } from './treeData'
 
@@ -35,6 +37,7 @@ export function VirtualObjectRows({
   const expandedNodes = useExplorerStore(s => s.expandedNodes)
   const childObjects = useExplorerStore(s => s.childObjects)
   const compositionCache = useExplorerStore(s => s.compositionCache)
+  const sessionGeneration = useConnectionStore(s => s.sessionGeneration)
 
   // Memoized so scroll-driven re-renders (which don't change any of these) reuse
   // the flattened list instead of re-walking the whole forest each frame.
@@ -127,6 +130,8 @@ export function VirtualObjectRows({
   useEffect(() => {
     const client = getClient()
     if (!client) return
+    const session = captureSession(client)
+    if (!session.isCurrent()) return
     const targets: ObjectInstance[] = []
     for (const vi of virtualItems) {
       const row = rows[vi.index]
@@ -135,9 +140,11 @@ export function VirtualObjectRows({
       }
     }
     if (targets.length === 0) return
-    const handle = setTimeout(() => { void resolveCompositionFlags(client, targets) }, 150)
+    const handle = setTimeout(() => {
+      if (session.isCurrent()) void resolveCompositionFlags(client, targets)
+    }, 150)
     return () => clearTimeout(handle)
-  }, [virtualItems, rows, compositionCache])
+  }, [virtualItems, rows, compositionCache, sessionGeneration])
 
   // Measure the true row height once from the first mounted object row so the
   // spacer math matches the DOM regardless of platform/theme (emoji glyph

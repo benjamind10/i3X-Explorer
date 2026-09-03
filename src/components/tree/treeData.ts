@@ -1,6 +1,7 @@
 import type { I3XClient } from '../../api/client'
 import { useExplorerStore } from '../../stores/explorer'
 import type { ObjectInstance } from '../../api/types'
+import { captureSession, isAbortError } from '../../session'
 
 // Special folder IDs
 export const NAMESPACES_FOLDER_ID = 'folder:namespaces'
@@ -19,6 +20,8 @@ export const ESTIMATED_ROW_HEIGHT = 28
 // objects are queried, so callers can pass a superset cheaply.
 export async function resolveCompositionFlags(client: I3XClient, loaded: ObjectInstance[]): Promise<void> {
   if (loaded.length === 0) return
+  const session = captureSession(client)
+  if (!session.isCurrent()) return
   const { compositionCache, mergeCompositionFlags } = useExplorerStore.getState()
   const toResolve: string[] = []
   for (const obj of loaded) {
@@ -30,6 +33,7 @@ export async function resolveCompositionFlags(client: I3XClient, loaded: ObjectI
   const additions = new Map<string, number>()
   try {
     const related = await client.getRelatedObjectsBatch(toResolve, 'HasComponent')
+    if (!session.isCurrent()) return
     for (const parentId of toResolve) {
       const children = related.get(parentId) ?? []
       const qualifyingCount = children.filter(c =>
@@ -38,9 +42,11 @@ export async function resolveCompositionFlags(client: I3XClient, loaded: ObjectI
       additions.set(parentId, qualifyingCount)
     }
   } catch (err) {
-    console.error('Failed to resolve composition flags via /objects/related:', err)
+    if (session.isCurrent() && !isAbortError(err)) {
+      console.error('Failed to resolve composition flags via /objects/related:', err)
+    }
   }
-  if (additions.size > 0) mergeCompositionFlags(additions)
+  if (session.isCurrent() && additions.size > 0) mergeCompositionFlags(additions)
 }
 
 // Coalesce + throttle full "all objects" refetches. Expanding a hierarchy node
@@ -54,22 +60,38 @@ export async function resolveCompositionFlags(client: I3XClient, loaded: ObjectI
 // VirtualObjectRows), never for the whole catalog here — a single batch over
 // tens of thousands of objects is slow and can fail, leaving chevrons wrong.
 const ALL_OBJECTS_REFETCH_TTL_MS = 3000
-let allObjectsFetchedAt = 0
-let allObjectsInFlight: Promise<void> | null = null
+interface AllObjectsRequestEntry {
+  fetchedAt: number
+  inFlight: Promise<void> | null
+}
+
+const allObjectsRequests = new WeakMap<I3XClient, AllObjectsRequestEntry>()
 
 export async function refreshAllObjects(client: I3XClient, force = false): Promise<void> {
-  if (allObjectsInFlight) return allObjectsInFlight
-  if (!force && Date.now() - allObjectsFetchedAt < ALL_OBJECTS_REFETCH_TTL_MS) return
-  allObjectsInFlight = (async () => {
+  const session = captureSession(client)
+  if (!session.isCurrent()) return
+
+  let entry = allObjectsRequests.get(client)
+  if (!entry) {
+    entry = { fetchedAt: 0, inFlight: null }
+    allObjectsRequests.set(client, entry)
+  }
+  if (entry.inFlight) return entry.inFlight
+  if (!force && Date.now() - entry.fetchedAt < ALL_OBJECTS_REFETCH_TTL_MS) return
+
+  let inFlight!: Promise<void>
+  inFlight = (async () => {
     try {
       const objects = await client.getObjects()
+      if (!session.isCurrent()) return
       useExplorerStore.getState().setAllObjects(objects)
-      allObjectsFetchedAt = Date.now()
+      entry.fetchedAt = Date.now()
     } finally {
-      allObjectsInFlight = null
+      if (entry.inFlight === inFlight) entry.inFlight = null
     }
   })()
-  return allObjectsInFlight
+  entry.inFlight = inFlight
+  return inFlight
 }
 
 // Chevron predicate: consult the compositionCache, which holds the actual child

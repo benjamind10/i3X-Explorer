@@ -2,6 +2,7 @@ import { useCallback } from 'react'
 import { useExplorerStore, type SelectedItem } from '../../stores/explorer'
 import { getClient } from '../../api/client'
 import type { Namespace, ObjectType, ObjectInstance } from '../../api/types'
+import { captureSession, isAbortError } from '../../session'
 import {
   resolveCompositionFlags,
   refreshAllObjects,
@@ -81,18 +82,23 @@ export function TreeNode({ id, label, type, data, depth, hasChildren, count, chi
     // Toggle expansion
     if (hasChildren) {
       toggleNode(id)
+      const client = getClient()
+      const session = client ? captureSession(client) : null
+      const canCommit = () => session?.isCurrent() ?? false
+      const logFailure = (message: string, error: unknown) => {
+        if (canCommit() && !isAbortError(error)) console.error(message, error)
+      }
 
       // Re-fetch objects for this type whenever expanding (always fresh)
       if (type === 'objectType' && !isExpanded) {
-        const client = getClient()
-        if (client) {
+        if (client && session) {
           try {
             const objectType = data as ObjectType
             const objects = await client.getObjects(objectType.elementId)
             await resolveCompositionFlags(client, objects)
-            setObjects(objectType.elementId, objects)
+            if (canCommit()) setObjects(objectType.elementId, objects)
           } catch (err) {
-            console.error('Failed to load objects:', err)
+            logFailure('Failed to load objects:', err)
           }
         }
       }
@@ -100,12 +106,11 @@ export function TreeNode({ id, label, type, data, depth, hasChildren, count, chi
       // Re-fetch all objects whenever expanding Objects or Hierarchy folder.
       // Opening a folder forces a fresh fetch (bypasses the navigation throttle).
       if ((id === OBJECTS_FOLDER_ID || id === HIERARCHICAL_FOLDER_ID) && !isExpanded) {
-        const client = getClient()
-        if (client) {
+        if (client && session) {
           try {
             await refreshAllObjects(client, true)
           } catch (err) {
-            console.error('Failed to load all objects:', err)
+            logFailure('Failed to load all objects:', err)
           }
         }
       }
@@ -113,14 +118,13 @@ export function TreeNode({ id, label, type, data, depth, hasChildren, count, chi
       // For the Hierarchy folder, also fetch root objects via root=true so the server
       // determines what counts as a root (avoids relying on parentId === '/' locally)
       if (id === HIERARCHICAL_FOLDER_ID && !isExpanded) {
-        const client = getClient()
-        if (client) {
+        if (client && session) {
           try {
             const roots = await client.getObjects(undefined, false, true)
             await resolveCompositionFlags(client, roots)
-            setHierarchicalRoots(roots)
+            if (canCommit()) setHierarchicalRoots(roots)
           } catch (err) {
-            console.error('Failed to load root objects:', err)
+            logFailure('Failed to load root objects:', err)
           }
         }
       }
@@ -129,12 +133,11 @@ export function TreeNode({ id, label, type, data, depth, hasChildren, count, chi
       // discovered objects. Throttled/coalesced so rapidly expanding many nodes
       // doesn't trigger a full 58k-object refetch per click on large catalogs.
       if (id.startsWith('hier:') && !isExpanded) {
-        const client = getClient()
-        if (client) {
+        if (client && session) {
           try {
             await refreshAllObjects(client)
           } catch (err) {
-            console.error('Failed to refresh objects for hierarchy node:', err)
+            logFailure('Failed to refresh objects for hierarchy node:', err)
           }
         }
       }
@@ -143,8 +146,7 @@ export function TreeNode({ id, label, type, data, depth, hasChildren, count, chi
       if (type === 'object' && !isExpanded && !id.startsWith('hier:')) {
         const obj = data as ObjectInstance
         if (obj.isComposition) {
-          const client = getClient()
-          if (client) {
+          if (client && session) {
             try {
               const related = await client.getRelatedObjects(obj.elementId, 'HasComponent')
               const compositionalChildren = related.filter(child =>
@@ -153,13 +155,14 @@ export function TreeNode({ id, label, type, data, depth, hasChildren, count, chi
                 child.parentId === obj.elementId
               )
               await resolveCompositionFlags(client, compositionalChildren)
+              if (!canCommit()) return
               setChildObjects(obj.elementId, compositionalChildren)
               // Reflect the real qualifying-child count on the parent so an
               // optimistic chevron self-corrects to "no chevron" when a click
               // reveals there is nothing to expand.
               mergeCompositionFlags([[obj.elementId, compositionalChildren.length]])
             } catch (err) {
-              console.error('Failed to load child objects:', err)
+              logFailure('Failed to load child objects:', err)
             }
           }
         }

@@ -214,10 +214,27 @@ export class I3XClient {
   private async request<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    operationSignal?: AbortSignal
   ): Promise<T> {
-    const { data } = await this.requestRaw<T>(method, path, body)
-    return data
+    if (!operationSignal || operationSignal === this.signal) {
+      const { data } = await this.requestRaw<T>(method, path, body)
+      return data
+    }
+
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    this.signal.addEventListener('abort', abort, { once: true })
+    operationSignal.addEventListener('abort', abort, { once: true })
+    if (this.signal.aborted || operationSignal.aborted) controller.abort()
+
+    try {
+      const { data } = await this.requestRaw<T>(method, path, body, controller.signal)
+      return data
+    } finally {
+      this.signal.removeEventListener('abort', abort)
+      operationSignal.removeEventListener('abort', abort)
+    }
   }
 
   // Detect API version by probing GET /info (v1 only). Falls back to v0.
@@ -294,7 +311,12 @@ export class I3XClient {
     return this.request<RelationshipType[]>('GET', `/relationshiptypes${params}`)
   }
 
-  async getObjects(typeId?: string, includeMetadata = false, root?: boolean): Promise<ObjectInstance[]> {
+  async getObjects(
+    typeId?: string,
+    includeMetadata = false,
+    root?: boolean,
+    signal?: AbortSignal
+  ): Promise<ObjectInstance[]> {
     const params = new URLSearchParams()
     // v1 renamed the query param: typeId → typeElementId
     if (typeId) params.set(this.isV1() ? 'typeElementId' : 'typeId', typeId)
@@ -302,7 +324,7 @@ export class I3XClient {
     params.set('includeMetadata', String(this.isV1() ? true : includeMetadata))
     // v1 supports root=true server-side; v0 doesn't have this param so we filter locally below.
     if (root && this.isV1()) params.set('root', 'true')
-    const raw = await this.request<Array<Record<string, unknown>>>('GET', `/objects?${params.toString()}`)
+    const raw = await this.request<Array<Record<string, unknown>>>('GET', `/objects?${params.toString()}`, undefined, signal)
     if (this.isV1()) {
       return raw.map(normalizeV1Object)
     }
