@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useConnectionStore } from '../../stores/connection'
 import { useExplorerStore } from '../../stores/explorer'
-import { useSubscriptionsStore } from '../../stores/subscriptions'
-import { createClient, destroyClient, getClient, type ApiVersion } from '../../api/client'
+import { createClient, destroyClient, normalizeServerUrl, type ApiVersion, type I3XClient } from '../../api/client'
+import { captureSession, endActiveSession, isAbortError, type SessionContext } from '../../session'
 import { SearchModal } from '../search/SearchModal'
 import iconPng from '/icon.png'
 
@@ -50,11 +50,17 @@ export function Toolbar() {
     setConnecting,
     setError,
     addRecentUrl,
-    disconnect: disconnectStore
+    invalidateSession
   } = useConnectionStore()
 
-  const { setNamespaces, setObjectTypes, setAllObjects, setHierarchicalRoots, setLoading, reset: resetExplorer, pollIntervalMs, setPollIntervalMs, triggerManualRefresh, sidebarCollapsed, toggleSidebar } = useExplorerStore()
-  const { clearAll: clearSubscriptions } = useSubscriptionsStore()
+  const { setNamespaces, setObjectTypes, setAllObjects, setHierarchicalRoots, setLoading, pollIntervalMs, setPollIntervalMs, triggerManualRefresh, sidebarCollapsed, toggleSidebar } = useExplorerStore()
+
+  useEffect(() => {
+    if (!isConnected) {
+      setApiVersion(null)
+      setRedirectNotice(null)
+    }
+  }, [isConnected])
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -68,6 +74,7 @@ export function Toolbar() {
   }, [isConnected])
 
   const handleConnect = async () => {
+    invalidateSession()
     setConnecting(true)
     setError(null)
     setRedirectNotice(null)
@@ -78,14 +85,19 @@ export function Toolbar() {
       setCredentials(activeCredentials)
     }
 
+    let client: I3XClient | null = null
+    let session: SessionContext | null = null
     try {
-      const client = createClient(serverUrl, activeCredentials)
+      client = createClient(serverUrl, activeCredentials)
+      session = captureSession(client)
       const success = await client.testConnection()
+
+      if (!session.isCurrent()) return
 
       if (success) {
         const detectedVersion = client.getApiVersion()
         if (detectedVersion === 'v0') {
-          destroyClient()
+          destroyClient(client)
           setConnecting(false)
           setShowV0Blocked(true)
           return
@@ -99,7 +111,7 @@ export function Toolbar() {
         // follow the new URL. Compare against the trailing-slash-stripped input since
         // the client constructor strips it too.
         const finalUrl = client.getBaseUrl()
-        if (finalUrl !== serverUrl.replace(/\/$/, '')) {
+        if (finalUrl !== normalizeServerUrl(serverUrl)) {
           setServerUrl(finalUrl)
           if (activeCredentials) {
             saveCredentialsForUrl(finalUrl, activeCredentials)
@@ -114,6 +126,7 @@ export function Toolbar() {
           client.getNamespaces(),
           client.getObjectTypes()
         ])
+        if (!session.isCurrent()) return
         setNamespaces(namespaces)
         setObjectTypes(objectTypes)
         setLoading(false)
@@ -122,32 +135,27 @@ export function Toolbar() {
         // tree's [count] indicators show before the user expands those folders.
         // Doesn't block the connect flow; expansion later refetches with
         // composition resolution, so chevron accuracy isn't affected.
-        client.getObjects().then(setAllObjects).catch(() => {})
-        client.getObjects(undefined, false, true).then(setHierarchicalRoots).catch(() => {})
+        client.getObjects().then(objects => {
+          if (session?.isCurrent()) setAllObjects(objects)
+        }).catch(() => {})
+        client.getObjects(undefined, false, true).then(roots => {
+          if (session?.isCurrent()) setHierarchicalRoots(roots)
+        }).catch(() => {})
       } else {
         setError('Failed to connect to server')
-        destroyClient()
+        destroyClient(client)
       }
     } catch (err) {
-      setLoading(false)
-      setError(err instanceof Error ? err.message : 'Connection failed')
-      destroyClient()
+      if (!session?.isCurrent()) return
+      if (isAbortError(err)) return
+      const message = err instanceof Error ? err.message : 'Connection failed'
+      await endActiveSession('connect-failed')
+      setError(message)
     }
   }
 
-  const handleDisconnect = async () => {
-    const client = getClient()
-    if (client) {
-      const ids = Array.from(useSubscriptionsStore.getState().subscriptions.keys())
-      await Promise.allSettled(ids.map(id => client.deleteSubscription(id)))
-    }
-
-    destroyClient()
-    disconnectStore()
-    resetExplorer()
-    clearSubscriptions()
-    setApiVersion(null)
-    setRedirectNotice(null)
+  const handleDisconnect = () => {
+    void endActiveSession('disconnect')
   }
 
   return (

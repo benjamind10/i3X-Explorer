@@ -1,16 +1,37 @@
 import { useState } from 'react'
 import { useConnectionStore } from '../../stores/connection'
 import type { Credentials } from '../../stores/connection'
+import { getClient, normalizeServerUrl } from '../../api/client'
+import { endActiveSession } from '../../session'
 
 const isElectron = typeof window !== 'undefined' && !!window.electronAPI
 
 type AuthMethod = 'none' | 'basic' | 'bearer' | 'header'
+
+function credentialsEqual(left: Credentials | null, right: Credentials | null): boolean {
+  if (left?.type !== right?.type) return false
+  if (!left || !right) return left === right
+
+  switch (left.type) {
+    case 'basic':
+      return right.type === 'basic'
+        && left.username === right.username
+        && left.password === right.password
+    case 'bearer':
+      return right.type === 'bearer' && left.token === right.token
+    case 'header':
+      return right.type === 'header'
+        && left.headerName.trim() === right.headerName.trim()
+        && left.headerValue === right.headerValue
+  }
+}
 
 export function ConnectionDialog() {
   const {
     serverUrl,
     recentUrls,
     ignoreCertErrors: storedIgnoreCertErrors,
+    isConnected,
     setServerUrl,
     setCredentials,
     saveCredentialsForUrl,
@@ -38,7 +59,6 @@ export function ConnectionDialog() {
   const [headerValue, setHeaderValue] = useState(savedCreds?.type === 'header' ? savedCreds.headerValue : '')
 
   const handleSave = () => {
-    setServerUrl(inputUrl)
     let newCredentials: Credentials | null = null
     if (authMethod === 'basic' && username) {
       newCredentials = { type: 'basic', username, password }
@@ -47,8 +67,21 @@ export function ConnectionDialog() {
     } else if (authMethod === 'header' && headerName && headerValue) {
       newCredentials = { type: 'header', headerName: headerName.trim(), headerValue }
     }
+
+    const normalizedUrl = normalizeServerUrl(inputUrl)
+    const activeClient = getClient()
+    const connectionChanged = isConnected && (
+      !activeClient
+      || activeClient.getBaseUrl() !== normalizedUrl
+      || !credentialsEqual(activeClient.getCredentials(), newCredentials)
+      || storedIgnoreCertErrors !== ignoreCertErrors
+    )
+
+    if (connectionChanged) void endActiveSession('settings-changed')
+
+    setServerUrl(normalizedUrl)
     setCredentials(newCredentials)
-    saveCredentialsForUrl(inputUrl, newCredentials)
+    saveCredentialsForUrl(normalizedUrl, newCredentials)
     setIgnoreCertErrors(ignoreCertErrors)
     window.electronAPI?.setIgnoreCertErrors(ignoreCertErrors)
     setShowConnectionDialog(false)

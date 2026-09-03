@@ -85,8 +85,12 @@ export interface StreamConfig {
 }
 
 export class I3XClient {
+  readonly sessionId: string
+  readonly signal: AbortSignal
+
   private baseUrl: string
   private credentials: ClientCredentials | null
+  private readonly sessionAbortController: AbortController
   private apiVersion: ApiVersion = 'v0'
   // Track last seen sequence number per subscription for v1 sync acknowledgment
   private syncSequenceNumbers = new Map<string, number>()
@@ -96,8 +100,19 @@ export class I3XClient {
   private capabilities: ServerCapabilities | null = null
 
   constructor(baseUrl: string, credentials?: ClientCredentials | null) {
-    this.baseUrl = baseUrl.replace(/\/$/, '')
+    this.sessionId = crypto.randomUUID()
+    this.sessionAbortController = new AbortController()
+    this.signal = this.sessionAbortController.signal
+    this.baseUrl = normalizeServerUrl(baseUrl)
     this.credentials = credentials ?? null
+  }
+
+  isActive(): boolean {
+    return !this.signal.aborted
+  }
+
+  dispose(): void {
+    if (!this.signal.aborted) this.sessionAbortController.abort()
   }
 
   getCredentials(): ClientCredentials | null {
@@ -137,7 +152,8 @@ export class I3XClient {
   private async requestRaw<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    signal: AbortSignal = this.signal
   ): Promise<{ data: T; status: number }> {
     // Fix localhost IPv6 issue - Chromium may prefer IPv6 but servers often only listen on IPv4
     let url = `${this.baseUrl}${path}`
@@ -152,7 +168,7 @@ export class I3XClient {
 
     Object.assign(headers, buildAuthHeaders(this.credentials));
 
-    const options: RequestInit = { method, headers }
+    const options: RequestInit = { method, headers, signal }
     if (body) {
       options.body = JSON.stringify(body)
     }
@@ -215,7 +231,7 @@ export class I3XClient {
       const headers: Record<string, string> = { 'Accept': 'application/json' }
       Object.assign(headers, buildAuthHeaders(this.credentials));
 
-      const response = await fetch(url, { method: 'GET', headers })
+      const response = await fetch(url, { method: 'GET', headers, signal: this.signal })
 
       // If the server redirected (e.g. http → https upgrade), adopt the final URL
       // for all subsequent requests. GETs survive a 301/302 redirect but browsers
@@ -534,15 +550,35 @@ export class I3XClient {
     // subscriptions that may already be expired server-side (404), and the
     // clientId/sequence entries must not outlive the subscription locally.
     try {
-      if (this.isV1()) {
-        const clientId = this.clientIds.get(subscriptionId)
-        await this.request<unknown>('POST', '/subscriptions/delete', { clientId, subscriptionIds: [subscriptionId] })
-      } else {
-        await this.request<unknown>('DELETE', `/subscriptions/${subscriptionId}`)
-      }
+      await this.deleteSubscriptionWithSignal(subscriptionId, this.signal)
     } finally {
       this.syncSequenceNumbers.delete(subscriptionId)
       this.clientIds.delete(subscriptionId)
+    }
+  }
+
+  async deleteSubscriptionsForCleanup(ids: string[], signal: AbortSignal): Promise<void> {
+    await Promise.allSettled(ids.map(async (subscriptionId) => {
+      try {
+        await this.deleteSubscriptionWithSignal(subscriptionId, signal)
+      } finally {
+        this.syncSequenceNumbers.delete(subscriptionId)
+        this.clientIds.delete(subscriptionId)
+      }
+    }))
+  }
+
+  private async deleteSubscriptionWithSignal(subscriptionId: string, signal: AbortSignal): Promise<void> {
+    if (this.isV1()) {
+      const clientId = this.clientIds.get(subscriptionId)
+      await this.requestRaw<unknown>(
+        'POST',
+        '/subscriptions/delete',
+        { clientId, subscriptionIds: [subscriptionId] },
+        signal
+      )
+    } else {
+      await this.requestRaw<unknown>('DELETE', `/subscriptions/${subscriptionId}`, undefined, signal)
     }
   }
 
@@ -672,15 +708,27 @@ export class I3XClient {
 // Singleton instance
 let clientInstance: I3XClient | null = null
 
+export function normalizeServerUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, '')
+}
+
 export function getClient(): I3XClient | null {
   return clientInstance
 }
 
 export function createClient(baseUrl: string, credentials?: ClientCredentials | null): I3XClient {
+  clientInstance?.dispose()
   clientInstance = new I3XClient(baseUrl, credentials)
   return clientInstance
 }
 
-export function destroyClient(): void {
+export function destroyClient(expectedClient?: I3XClient): void {
+  if (expectedClient && clientInstance !== expectedClient) return
+  const removedClient = clientInstance
   clientInstance = null
+  removedClient?.dispose()
+}
+
+export function isCurrentClient(client: I3XClient): boolean {
+  return clientInstance === client && client.isActive()
 }
