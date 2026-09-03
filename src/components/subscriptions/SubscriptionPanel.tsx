@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSubscriptionsStore } from '../../stores/subscriptions'
 import { useConnectionStore } from '../../stores/connection'
 import { getClient, type I3XClient } from '../../api/client'
 import { SSESubscription, PollingSubscription, HttpStatusError, isSubscriptionGoneError } from '../../api/subscription'
+import { captureSession, isAbortError, type SessionContext } from '../../session'
 import { TrendView } from './TrendView'
 import type { SyncResponseItem } from '../../api/types'
 
@@ -25,30 +26,48 @@ export function SubscriptionPanel() {
   const sseRef = useRef<SSESubscription | null>(null)
   const pollingRef = useRef<PollingSubscription | null>(null)
   const recoveryAttemptsRef = useRef(0)
+  const transportRunRef = useRef(0)
   const [usePolling, setUsePolling] = useState(false) // Default to SSE streaming
+
+  const stopTransports = useCallback(() => {
+    sseRef.current?.disconnect()
+    sseRef.current = null
+    pollingRef.current?.stop()
+    pollingRef.current = null
+  }, [])
+
+  const invalidateTransportRun = useCallback(() => {
+    transportRunRef.current++
+    stopTransports()
+  }, [stopTransports])
+
+  const acceptsTransportRun = (session: SessionContext, runGeneration: number) =>
+    session.isCurrent() && transportRunRef.current === runGeneration
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      sseRef.current?.disconnect()
-      pollingRef.current?.stop()
+      invalidateTransportRun()
     }
-  }, [])
+  }, [invalidateTransportRun])
 
   // Cleanup when disconnected from server
   useEffect(() => {
     if (!isConnected) {
-      sseRef.current?.disconnect()
-      sseRef.current = null
-      pollingRef.current?.stop()
-      pollingRef.current = null
+      invalidateTransportRun()
       clearAll()
     }
-  }, [isConnected, clearAll])
+  }, [isConnected, clearAll, invalidateTransportRun])
 
-  const handleDataUpdate = (items: SyncResponseItem[]) => {
+  const handleDataUpdate = (
+    items: SyncResponseItem[],
+    session: SessionContext,
+    runGeneration: number
+  ) => {
+    if (!acceptsTransportRun(session, runGeneration)) return
     recoveryAttemptsRef.current = 0
     items.forEach((item) => {
+      if (!acceptsTransportRun(session, runGeneration)) return
       updateLiveValue({
         elementId: item.elementId,
         displayName: item.elementId,
@@ -60,13 +79,16 @@ export function SubscriptionPanel() {
     })
   }
 
-  const handleRecovery = async (oldSubscriptionId: string) => {
-    const client = getClient()
-    if (!client) return
-
+  const handleRecovery = async (
+    oldSubscriptionId: string,
+    client: I3XClient,
+    session: SessionContext,
+    runGeneration: number
+  ) => {
+    if (!acceptsTransportRun(session, runGeneration)) return
     if (recoveryAttemptsRef.current >= 3) {
       console.warn(`Subscription ${oldSubscriptionId} recovery aborted after 3 attempts`)
-      setStreaming(oldSubscriptionId, false)
+      if (acceptsTransportRun(session, runGeneration)) setStreaming(oldSubscriptionId, false)
       return
     }
     recoveryAttemptsRef.current++
@@ -76,19 +98,22 @@ export function SubscriptionPanel() {
     const oldSub = currentSubs.get(oldSubscriptionId)
     const monitoredItems = oldSub?.monitoredItems ?? []
 
-    monitoredItems.forEach((elementId) => {
-      removeMonitoredItem(oldSubscriptionId, elementId)
-    })
-    removeSubscription(oldSubscriptionId)
     // Best-effort delete on the server — the subscription is likely already gone (404/410)
     // but this cleans up the clientId entry from the client-side map.
     try { await client.deleteSubscription(oldSubscriptionId) } catch { /* already gone */ }
+    if (!acceptsTransportRun(session, runGeneration)) return
 
     try {
       const { subscriptionId: newId } = await client.createSubscription()
+      if (!acceptsTransportRun(session, runGeneration)) return
       if (monitoredItems.length > 0) {
         await client.registerMonitoredItems(newId, monitoredItems)
       }
+      if (!acceptsTransportRun(session, runGeneration)) return
+      monitoredItems.forEach((elementId) => {
+        removeMonitoredItem(oldSubscriptionId, elementId)
+      })
+      removeSubscription(oldSubscriptionId)
       addSubscription({
         id: newId,
         createdAt: new Date().toISOString(),
@@ -96,9 +121,11 @@ export function SubscriptionPanel() {
         isStreaming: false
       })
       setActiveSubscription(newId)
-      await handleStartStream(newId)
+      startTransport(newId, client)
     } catch (err) {
-      console.error('Subscription recovery failed:', err)
+      if (acceptsTransportRun(session, runGeneration) && !isAbortError(err)) {
+        console.error('Subscription recovery failed:', err)
+      }
     }
   }
 
@@ -107,14 +134,22 @@ export function SubscriptionPanel() {
   const isStreamUnsupported = (client: I3XClient): boolean =>
     client.getApiVersion() === 'v1' && client.getCapabilities()?.subscribe?.stream === false
 
-  const startPolling = (subscriptionId: string, client: I3XClient) => {
+  const startPolling = (
+    subscriptionId: string,
+    client: I3XClient,
+    session: SessionContext,
+    runGeneration: number
+  ) => {
+    if (!acceptsTransportRun(session, runGeneration)) return
+    pollingRef.current?.stop()
     // Use polling (QoS2) - more reliable, works with CORS
     pollingRef.current = new PollingSubscription(
-      () => client.sync(subscriptionId),
-      handleDataUpdate,
+      (signal) => client.sync(subscriptionId, signal),
+      (items) => handleDataUpdate(items, session, runGeneration),
       (error) => {
+        if (!acceptsTransportRun(session, runGeneration)) return
         if (isSubscriptionGoneError(error)) {
-          handleRecovery(subscriptionId)
+          void handleRecovery(subscriptionId, client, session, runGeneration)
         } else {
           console.error('Polling error:', error)
           setStreaming(subscriptionId, false)
@@ -125,34 +160,35 @@ export function SubscriptionPanel() {
     pollingRef.current.start()
   }
 
-  const handleStartStream = async (subscriptionId: string) => {
-    const client = getClient()
-    if (!client) return
-
-    // Disconnect existing connections
-    sseRef.current?.disconnect()
-    pollingRef.current?.stop()
+  const startTransport = (subscriptionId: string, client: I3XClient) => {
+    invalidateTransportRun()
+    const runGeneration = transportRunRef.current
+    const session = captureSession(client)
+    if (!acceptsTransportRun(session, runGeneration)) return
 
     const isRelease = client.getApiVersion() === 'v1'
 
     if (usePolling || isStreamUnsupported(client)) {
-      if (!usePolling) setUsePolling(true)
-      startPolling(subscriptionId, client)
+      if (!usePolling && acceptsTransportRun(session, runGeneration)) setUsePolling(true)
+      startPolling(subscriptionId, client, session, runGeneration)
     } else {
       // Use SSE (QoS0) - real-time but may have CORS issues
       // v0: GET /subscriptions/{id}/stream  v1: POST /subscriptions/stream
       const streamConfig = client.getStreamConfig(subscriptionId)
       sseRef.current = new SSESubscription(
         streamConfig.url,
-        handleDataUpdate,
+        (items) => handleDataUpdate(items, session, runGeneration),
         (error) => {
+          if (!acceptsTransportRun(session, runGeneration)) return
           if (isSubscriptionGoneError(error)) {
-            handleRecovery(subscriptionId)
+            void handleRecovery(subscriptionId, client, session, runGeneration)
           } else if (isRelease && error instanceof HttpStatusError && error.status === 501) {
             // 1.0: 501 = streaming permanently unsupported — fall back to polling
             console.warn('Server does not support SSE streaming (HTTP 501), falling back to polling')
             setUsePolling(true)
-            startPolling(subscriptionId, client)
+            sseRef.current?.disconnect()
+            sseRef.current = null
+            startPolling(subscriptionId, client, session, runGeneration)
           } else {
             console.error('SSE error:', error)
             setStreaming(subscriptionId, false)
@@ -166,30 +202,35 @@ export function SubscriptionPanel() {
       sseRef.current.connect()
     }
 
-    setStreaming(subscriptionId, true)
+    if (acceptsTransportRun(session, runGeneration)) setStreaming(subscriptionId, true)
+  }
+
+  const handleStartStream = (subscriptionId: string) => {
+    const client = getClient()
+    if (client) startTransport(subscriptionId, client)
   }
 
   const handleStopStream = (subscriptionId: string) => {
-    sseRef.current?.disconnect()
-    pollingRef.current?.stop()
-    setStreaming(subscriptionId, false)
+    const client = getClient()
+    const session = client ? captureSession(client) : null
+    invalidateTransportRun()
+    if (session?.isCurrent()) setStreaming(subscriptionId, false)
   }
 
   const handleDelete = async (subscriptionId: string) => {
     const client = getClient()
     if (!client) return
+    const session = captureSession(client)
 
-    // Stop transport first to close timer-fire race window
-    sseRef.current?.disconnect()
-    sseRef.current = null
-    pollingRef.current?.stop()
-    pollingRef.current = null
+    invalidateTransportRun()
 
     try {
-      removeSubscription(subscriptionId)
+      if (session.isCurrent()) removeSubscription(subscriptionId)
       await client.deleteSubscription(subscriptionId)
     } catch (err) {
-      console.error('Failed to delete subscription:', err)
+      if (session.isCurrent() && !isAbortError(err)) {
+        console.error('Failed to delete subscription:', err)
+      }
     }
   }
 

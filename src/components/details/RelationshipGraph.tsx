@@ -160,9 +160,10 @@ export function RelationshipGraph({ object }: RelationshipGraphProps) {
       if (isAbortError(err) || !session.isCurrent() || requestId !== latestRelationshipRequestRef.current) return
       setError(err instanceof Error ? err.message : 'Failed to load relationships')
     } finally {
-      if (!session.isCurrent() || requestId !== latestRelationshipRequestRef.current) return
-      if (relationshipControllerRef.current === controller) relationshipControllerRef.current = null
-      setIsLoading(false)
+      if (session.isCurrent() && requestId === latestRelationshipRequestRef.current) {
+        if (relationshipControllerRef.current === controller) relationshipControllerRef.current = null
+        setIsLoading(false)
+      }
     }
   }, [isConnected, object.elementId, object.parentId, sessionGeneration])
 

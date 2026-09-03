@@ -79,7 +79,9 @@ export async function refreshAllObjects(client: I3XClient, force = false): Promi
   if (entry.inFlight) return entry.inFlight
   if (!force && Date.now() - entry.fetchedAt < ALL_OBJECTS_REFETCH_TTL_MS) return
 
+  // Assigned before the async continuation reaches finally; identity guards cache cleanup.
   let inFlight!: Promise<void>
+  // eslint-disable-next-line prefer-const
   inFlight = (async () => {
     try {
       const objects = await client.getObjects()

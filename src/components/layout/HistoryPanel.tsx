@@ -163,9 +163,10 @@ export function HistoryPanel() {
       setError(err instanceof Error ? err.message : 'Failed to fetch history')
       if (!retainContent) setHistoryData([])
     } finally {
-      if (!isCurrent()) return
-      if (requestControllerRef.current === controller) requestControllerRef.current = null
-      setIsLoading(false)
+      if (isCurrent()) {
+        if (requestControllerRef.current === controller) requestControllerRef.current = null
+        setIsLoading(false)
+      }
     }
   }, [selectedElementId, isObjectSelected, isConnected, isCollapsed, selectedTimespan, customStartTime, customEndTime, sessionGeneration])
 

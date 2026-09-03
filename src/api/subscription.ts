@@ -47,6 +47,7 @@ function extractVQT(payload: Record<string, unknown>): { value: unknown; quality
 
 export class SSESubscription {
   private abortController: AbortController | null = null
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null
   private url: string
   private credentials: ClientCredentials | null
   private postBody: object | undefined
@@ -57,6 +58,7 @@ export class SSESubscription {
   private maxReconnectAttempts = 5
   private reconnectDelay = 1000
   private connected = false
+  private runGeneration = 0
 
   constructor(
     url: string,
@@ -84,11 +86,17 @@ export class SSESubscription {
 
   connect(): void {
     this.disconnect()
-    this.abortController = new AbortController()
-    this.startFetch()
+    const runGeneration = ++this.runGeneration
+    const controller = new AbortController()
+    this.abortController = controller
+    void this.startFetch(runGeneration, controller)
   }
 
-  private async startFetch(): Promise<void> {
+  private isCurrentRun(runGeneration: number): boolean {
+    return this.runGeneration === runGeneration
+  }
+
+  private async startFetch(runGeneration: number, controller: AbortController): Promise<void> {
     const headers: Record<string, string> = {
       'Accept': 'text/event-stream'
     }
@@ -104,15 +112,17 @@ export class SSESubscription {
         method: this.postBody ? 'POST' : 'GET',
         headers,
         body: this.postBody ? JSON.stringify(this.postBody) : undefined,
-        signal: this.abortController?.signal
+        signal: controller.signal
       })
+
+      if (!this.isCurrentRun(runGeneration)) return
 
       if (!response.ok) {
         const err = new HttpStatusError(response.status, response.statusText)
         // 404/410 means the subscription is gone — retrying will always fail.
         // failFastStatuses (e.g. 501 = streaming unsupported) are equally permanent.
         if (response.status === 404 || response.status === 410 || this.failFastStatuses.includes(response.status)) {
-          this.onError(err)
+          if (this.isCurrentRun(runGeneration)) this.onError(err)
           return
         }
         throw err
@@ -132,6 +142,7 @@ export class SSESubscription {
 
       while (true) {
         const { done, value } = await reader.read()
+        if (!this.isCurrentRun(runGeneration)) return
         if (done) break
 
         buffer += decoder.decode(value, { stream: true })
@@ -142,7 +153,7 @@ export class SSESubscription {
           if (line.startsWith('data: ')) {
             const dataStr = line.slice(6)
             if (dataStr.trim()) {
-              this.processMessage(dataStr)
+              this.processMessage(dataStr, runGeneration)
             }
           }
         }
@@ -150,19 +161,20 @@ export class SSESubscription {
 
       // Stream ended normally
       this.connected = false
-      this.handleDisconnect()
+      this.handleDisconnect(runGeneration)
     } catch (err) {
+      if (!this.isCurrentRun(runGeneration)) return
       this.connected = false
       if (err instanceof Error && err.name === 'AbortError') {
         // Intentional disconnect, don't reconnect
         return
       }
       console.error('SSE error:', err)
-      this.handleDisconnect()
+      this.handleDisconnect(runGeneration)
     }
   }
 
-  private processMessage(dataStr: string): void {
+  private processMessage(dataStr: string, runGeneration: number): void {
     try {
       const rawData = JSON.parse(dataStr) as Array<Record<string, unknown>>
       const items: SyncResponseItem[] = []
@@ -203,7 +215,7 @@ export class SSESubscription {
           }
         }
       }
-      if (items.length > 0) {
+      if (items.length > 0 && this.isCurrentRun(runGeneration)) {
         this.onData(items)
       }
     } catch (err) {
@@ -211,22 +223,34 @@ export class SSESubscription {
     }
   }
 
-  private handleDisconnect(): void {
+  private handleDisconnect(runGeneration: number): void {
+    if (!this.isCurrentRun(runGeneration)) return
+
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++
       const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1)
       console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`)
 
-      setTimeout(() => {
-        this.abortController = new AbortController()
-        this.startFetch()
+      this.reconnectTimeout = setTimeout(() => {
+        this.reconnectTimeout = null
+        if (!this.isCurrentRun(runGeneration)) return
+        const controller = new AbortController()
+        this.abortController = controller
+        void this.startFetch(runGeneration, controller)
       }, delay)
     } else {
-      this.onError(new Error('Max reconnection attempts reached'))
+      if (this.isCurrentRun(runGeneration)) {
+        this.onError(new Error('Max reconnection attempts reached'))
+      }
     }
   }
 
   disconnect(): void {
+    this.runGeneration++
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout)
+      this.reconnectTimeout = null
+    }
     if (this.abortController) {
       this.abortController.abort()
       this.abortController = null
@@ -243,13 +267,16 @@ export class SSESubscription {
 // Polling-based subscription (QoS 2 fallback)
 export class PollingSubscription {
   private intervalId: ReturnType<typeof setInterval> | null = null
-  private syncFn: () => Promise<SyncResponseItem[]>
+  private syncFn: (signal: AbortSignal) => Promise<SyncResponseItem[]>
   private onData: SubscriptionCallback
   private onError: ErrorCallback
   private pollInterval: number
+  private runGeneration = 0
+  private operationController: AbortController | null = null
+  private inFlightGeneration: number | null = null
 
   constructor(
-    syncFn: () => Promise<SyncResponseItem[]>,
+    syncFn: (signal: AbortSignal) => Promise<SyncResponseItem[]>,
     onData: SubscriptionCallback,
     onError: ErrorCallback,
     pollInterval = 1000
@@ -262,26 +289,47 @@ export class PollingSubscription {
 
   start(): void {
     this.stop()
-    this.poll() // Initial poll
-    this.intervalId = setInterval(() => this.poll(), this.pollInterval)
+    const runGeneration = ++this.runGeneration
+    const controller = new AbortController()
+    this.operationController = controller
+    void this.poll(runGeneration, controller.signal)
+    this.intervalId = setInterval(() => {
+      void this.poll(runGeneration, controller.signal)
+    }, this.pollInterval)
   }
 
-  private async poll(): Promise<void> {
+  private isCurrentRun(runGeneration: number, signal: AbortSignal): boolean {
+    return this.runGeneration === runGeneration && !signal.aborted
+  }
+
+  private async poll(runGeneration: number, signal: AbortSignal): Promise<void> {
+    if (!this.isCurrentRun(runGeneration, signal) || this.inFlightGeneration === runGeneration) return
+    this.inFlightGeneration = runGeneration
+
     try {
-      const items = await this.syncFn()
-      if (items.length > 0) {
+      const items = await this.syncFn(signal)
+      if (items.length > 0 && this.isCurrentRun(runGeneration, signal)) {
         this.onData(items)
       }
     } catch (err) {
-      this.onError(err instanceof Error ? err : new Error(String(err)))
+      if (this.isCurrentRun(runGeneration, signal)) {
+        this.onError(err instanceof Error ? err : new Error(String(err)))
+      }
+    } finally {
+      if (this.inFlightGeneration === runGeneration) {
+        this.inFlightGeneration = null
+      }
     }
   }
 
   stop(): void {
+    this.runGeneration++
     if (this.intervalId) {
       clearInterval(this.intervalId)
       this.intervalId = null
     }
+    this.operationController?.abort()
+    this.operationController = null
   }
 
   isRunning(): boolean {

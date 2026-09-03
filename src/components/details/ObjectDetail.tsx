@@ -59,9 +59,10 @@ export function ObjectDetail({ object }: ObjectDetailProps) {
       if (isAbortError(err) || !session.isCurrent() || requestId !== latestValueRequestRef.current) return
       setValueError(err instanceof Error ? err.message : 'Failed to load value')
     } finally {
-      if (!session.isCurrent() || requestId !== latestValueRequestRef.current) return
-      if (valueControllerRef.current === controller) valueControllerRef.current = null
-      setIsLoadingValue(false)
+      if (session.isCurrent() && requestId === latestValueRequestRef.current) {
+        if (valueControllerRef.current === controller) valueControllerRef.current = null
+        setIsLoadingValue(false)
+      }
     }
   }, [isConnected, object.elementId, object.isComposition, sessionGeneration])
 

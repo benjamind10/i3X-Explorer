@@ -653,7 +653,7 @@ export class I3XClient {
     return this.request<unknown>('POST', `/subscriptions/${subscriptionId}/unregister`, { elementIds })
   }
 
-  async sync(subscriptionId: string): Promise<SyncResponseItem[]> {
+  async sync(subscriptionId: string, signal?: AbortSignal): Promise<SyncResponseItem[]> {
     let raw: Array<Record<string, unknown>>
 
     if (this.isV1()) {
@@ -661,17 +661,17 @@ export class I3XClient {
       // 1.0: server returns HTTP 206 when queue overflow caused update loss (partial content)
       const lastSeq = this.syncSequenceNumbers.get(subscriptionId)
       const clientId = this.clientIds.get(subscriptionId)
-      const { data, status } = await this.requestRaw<Array<Record<string, unknown>>>('POST', '/subscriptions/sync', {
+      const { data, status } = await this.requestRawForOperation<Array<Record<string, unknown>>>('POST', '/subscriptions/sync', {
         clientId,
         subscriptionId,
         ...(lastSeq !== undefined ? { lastSequenceNumber: lastSeq } : {})
-      })
+      }, signal)
       raw = data
       if (status === 206) {
         console.warn(`[i3x] sync 206: subscription ${subscriptionId} queue overflowed — some updates were dropped`)
       }
     } else {
-      raw = await this.request<Array<Record<string, unknown>>>('POST', `/subscriptions/${subscriptionId}/sync`)
+      raw = await this.request<Array<Record<string, unknown>>>('POST', `/subscriptions/${subscriptionId}/sync`, undefined, signal)
     }
 
     const items: SyncResponseItem[] = []
