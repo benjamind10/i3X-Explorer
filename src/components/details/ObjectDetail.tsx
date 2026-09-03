@@ -1,6 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import type { ObjectInstance, LastKnownValue } from '../../api/types'
 import { getClient } from '../../api/client'
+import { captureSession, isAbortError } from '../../session'
+import { useConnectionStore } from '../../stores/connection'
 import { useSubscriptionsStore } from '../../stores/subscriptions'
 import { JsonViewer } from './JsonViewer'
 import { ValueDisplay } from './ValueDisplay'
@@ -19,22 +21,29 @@ export function ObjectDetail({ object }: ObjectDetailProps) {
 
   const [isSubscribing, setIsSubscribing] = useState(false)
   const [subscribeError, setSubscribeError] = useState<string | null>(null)
+  const latestValueRequestRef = useRef(0)
+  const valueControllerRef = useRef<AbortController | null>(null)
+  const isConnected = useConnectionStore(state => state.isConnected)
+  const sessionGeneration = useConnectionStore(state => state.sessionGeneration)
 
   const { activeSubscriptionId, addMonitoredItem, removeSubscription, setBottomPanelExpanded } = useSubscriptionsStore()
 
-  useEffect(() => {
-    loadValue()
-  }, [object.elementId])
-
-  // Clear subscribe error when the selected object changes
-  useEffect(() => {
-    setSubscribeError(null)
-  }, [object.elementId])
-
-  const loadValue = async () => {
+  const loadValue = useCallback(async (retainContent = true) => {
     const client = getClient()
-    if (!client) return
+    if (!client || !isConnected) {
+      setValue(null)
+      setValueError(null)
+      setIsLoadingValue(false)
+      return
+    }
 
+    valueControllerRef.current?.abort()
+    const controller = new AbortController()
+    valueControllerRef.current = controller
+    const requestId = ++latestValueRequestRef.current
+    const session = captureSession(client)
+
+    if (!retainContent) setValue(null)
     setIsLoadingValue(true)
     setValueError(null)
 
@@ -43,14 +52,28 @@ export function ObjectDetail({ object }: ObjectDetailProps) {
       // when queried with maxDepth=0 (infinite recursion through HasComponent).
       // Beta/pre-release servers keep the default maxDepth=1 behavior untouched.
       const maxDepth = client.getApiVersion() === 'v1' && object.isComposition ? 0 : 1
-      const result = await client.getValue(object.elementId, maxDepth)
+      const result = await client.getValue(object.elementId, maxDepth, controller.signal)
+      if (!session.isCurrent() || requestId !== latestValueRequestRef.current) return
       setValue(result)
     } catch (err) {
+      if (isAbortError(err) || !session.isCurrent() || requestId !== latestValueRequestRef.current) return
       setValueError(err instanceof Error ? err.message : 'Failed to load value')
     } finally {
+      if (!session.isCurrent() || requestId !== latestValueRequestRef.current) return
+      if (valueControllerRef.current === controller) valueControllerRef.current = null
       setIsLoadingValue(false)
     }
-  }
+  }, [isConnected, object.elementId, object.isComposition, sessionGeneration])
+
+  useEffect(() => {
+    setSubscribeError(null)
+    void loadValue(false)
+    return () => {
+      latestValueRequestRef.current++
+      valueControllerRef.current?.abort()
+      valueControllerRef.current = null
+    }
+  }, [loadValue])
 
   const handleSubscribe = async () => {
     const client = getClient()
@@ -216,11 +239,11 @@ export function ObjectDetail({ object }: ObjectDetailProps) {
                 ))}
               </div>
               <button
-                onClick={loadValue}
+                onClick={() => void loadValue(true)}
                 disabled={isLoadingValue}
                 className="text-xs text-i3x-primary hover:text-i3x-primary/80"
               >
-                {isLoadingValue ? 'Loading...' : 'Refresh'}
+                {isLoadingValue && value ? 'Updating...' : isLoadingValue ? 'Loading...' : 'Refresh'}
               </button>
             </div>
           </div>
@@ -229,10 +252,16 @@ export function ObjectDetail({ object }: ObjectDetailProps) {
               {valueError}
             </div>
           ) : value ? (
-            <ValueDisplay value={value} view={valueView} />
+            <div aria-busy={isLoadingValue}>
+              <ValueDisplay value={value} view={valueView} />
+            </div>
+          ) : isLoadingValue ? (
+            <div role="status" className="flex items-center justify-center h-48 text-sm text-i3x-text-muted">
+              Loading value...
+            </div>
           ) : (
             <div className="px-3 py-2 bg-i3x-surface rounded text-sm text-i3x-text-muted">
-              {isLoadingValue ? 'Loading...' : 'No value available'}
+              No value available
             </div>
           )}
         </div>

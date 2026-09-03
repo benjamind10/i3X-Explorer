@@ -1,6 +1,8 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import type { ObjectInstance } from '../../api/types'
 import { getClient } from '../../api/client'
+import { captureSession, isAbortError } from '../../session'
+import { useConnectionStore } from '../../stores/connection'
 import { useExplorerStore } from '../../stores/explorer'
 
 interface RelationshipGraphProps {
@@ -53,27 +55,40 @@ export function RelationshipGraph({ object }: RelationshipGraphProps) {
   const [error, setError] = useState<string | null>(null)
   const [tooltip, setTooltip] = useState<{ label: string; x: number; y: number } | null>(null)
   const { allObjects, selectItem, setAllObjects, setHierarchicalRoots } = useExplorerStore()
+  const isConnected = useConnectionStore(state => state.isConnected)
+  const sessionGeneration = useConnectionStore(state => state.sessionGeneration)
+  const latestRelationshipRequestRef = useRef(0)
+  const relationshipControllerRef = useRef<AbortController | null>(null)
+  const latestNavigationRequestRef = useRef(0)
+  const navigationControllerRef = useRef<AbortController | null>(null)
 
-  const handleNodeClick = async (related: RelatedObject) => {
+  const handleNodeClick = useCallback(async (related: RelatedObject) => {
     const client = getClient()
-    if (!client) return
+    if (!client || !isConnected) return
+
+    navigationControllerRef.current?.abort()
+    const controller = new AbortController()
+    navigationControllerRef.current = controller
+    const requestId = ++latestNavigationRequestRef.current
+    const session = captureSession(client)
+    const isCurrent = () => session.isCurrent() && requestId === latestNavigationRequestRef.current
 
     try {
-      // Resolve the full object (use cache if available)
       const cached = allObjects.find(o => o.elementId === related.elementId)
-      const obj: ObjectInstance = cached ?? await client.getObject(related.elementId)
+      const obj: ObjectInstance = cached ?? await client.getObject(related.elementId, controller.signal)
+      if (!isCurrent()) return
 
-      // Guard: ensure allObjects is populated
       let knownObjects = useExplorerStore.getState().allObjects
       if (knownObjects.length === 0) {
-        knownObjects = await client.getObjects()
+        knownObjects = await client.getObjects(undefined, false, undefined, controller.signal)
+        if (!isCurrent()) return
         setAllObjects(knownObjects)
       }
 
-      // Guard: ensure hierarchicalRoots is populated (independent of allObjects check)
       let roots = useExplorerStore.getState().hierarchicalRoots
       if (roots.length === 0) {
-        roots = await client.getObjects(undefined, false, true)
+        roots = await client.getObjects(undefined, false, true, controller.signal)
+        if (!isCurrent()) return
         setHierarchicalRoots(roots)
       }
 
@@ -92,28 +107,39 @@ export function RelationshipGraph({ object }: RelationshipGraphProps) {
         current = parent
       }
 
-      // Single write then select — state must be set before the selection fires
+      if (!isCurrent()) return
       useExplorerStore.setState({ expandedNodes: newExpanded })
       selectItem({ type: 'object', id: `hier:${obj.elementId}`, data: obj })
     } catch (err) {
-      console.error('Failed to navigate to node:', err)
+      if (!isAbortError(err) && isCurrent()) console.error('Failed to navigate to node:', err)
+    } finally {
+      if (navigationControllerRef.current === controller) navigationControllerRef.current = null
     }
-  }
+  }, [allObjects, isConnected, selectItem, setAllObjects, setHierarchicalRoots, sessionGeneration])
 
-  useEffect(() => {
-    loadRelationships()
-  }, [object.elementId])
-
-  const loadRelationships = async () => {
+  const loadRelationships = useCallback(async () => {
     const client = getClient()
-    if (!client) return
+    if (!client || !isConnected) {
+      setRelatedObjects([])
+      setError(null)
+      setIsLoading(false)
+      return
+    }
 
+    relationshipControllerRef.current?.abort()
+    const controller = new AbortController()
+    relationshipControllerRef.current = controller
+    const requestId = ++latestRelationshipRequestRef.current
+    const session = captureSession(client)
+
+    setRelatedObjects([])
     setIsLoading(true)
     setError(null)
 
     try {
       // Get all related objects with a single API call (no relationship type filter)
-      const related = await client.getRelatedObjects(object.elementId)
+      const related = await client.getRelatedObjects(object.elementId, undefined, false, controller.signal)
+      if (!session.isCurrent() || requestId !== latestRelationshipRequestRef.current) return
 
       // Map to our RelatedObject format
       const graphRelationships: RelatedObject[] = related.map(r => ({
@@ -131,11 +157,27 @@ export function RelationshipGraph({ object }: RelationshipGraphProps) {
 
       setRelatedObjects(graphRelationships)
     } catch (err) {
+      if (isAbortError(err) || !session.isCurrent() || requestId !== latestRelationshipRequestRef.current) return
       setError(err instanceof Error ? err.message : 'Failed to load relationships')
     } finally {
+      if (!session.isCurrent() || requestId !== latestRelationshipRequestRef.current) return
+      if (relationshipControllerRef.current === controller) relationshipControllerRef.current = null
       setIsLoading(false)
     }
-  }
+  }, [isConnected, object.elementId, object.parentId, sessionGeneration])
+
+  useEffect(() => {
+    setTooltip(null)
+    void loadRelationships()
+    return () => {
+      latestRelationshipRequestRef.current++
+      relationshipControllerRef.current?.abort()
+      relationshipControllerRef.current = null
+      latestNavigationRequestRef.current++
+      navigationControllerRef.current?.abort()
+      navigationControllerRef.current = null
+    }
+  }, [loadRelationships])
 
   // Derive the whole canvas from how far the node circle actually reaches, then
   // place the cluster dead-center (horizontally and vertically) with the legend
@@ -170,7 +212,7 @@ export function RelationshipGraph({ object }: RelationshipGraphProps) {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-48 text-i3x-text-muted">
+      <div role="status" className="flex items-center justify-center h-48 text-i3x-text-muted">
         Loading relationships...
       </div>
     )

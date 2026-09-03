@@ -237,6 +237,30 @@ export class I3XClient {
     }
   }
 
+  private async requestRawForOperation<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    operationSignal?: AbortSignal
+  ): Promise<{ data: T; status: number }> {
+    if (!operationSignal || operationSignal === this.signal) {
+      return this.requestRaw<T>(method, path, body)
+    }
+
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    this.signal.addEventListener('abort', abort, { once: true })
+    operationSignal.addEventListener('abort', abort, { once: true })
+    if (this.signal.aborted || operationSignal.aborted) controller.abort()
+
+    try {
+      return await this.requestRaw<T>(method, path, body, controller.signal)
+    } finally {
+      this.signal.removeEventListener('abort', abort)
+      operationSignal.removeEventListener('abort', abort)
+    }
+  }
+
   // Detect API version by probing GET /info (v1 only). Falls back to v0.
   // Distinguishes v1-beta from v1 (Release) by looking for a specVersion/version field in /info.
   private async detectVersion(): Promise<void> {
@@ -334,26 +358,27 @@ export class I3XClient {
     return all
   }
 
-  async getObject(elementId: string): Promise<ObjectInstance> {
+  async getObject(elementId: string, signal?: AbortSignal): Promise<ObjectInstance> {
     if (this.isV1()) {
       // v1: GET /objects/{id} removed; use POST /objects/list with single elementId
       const raw = await this.request<unknown>('POST', '/objects/list', {
         elementIds: [elementId],
         includeMetadata: true
-      })
+      }, signal)
       const results = extractV1BulkResults<Record<string, unknown>>(raw)
       const item = results.find(r => r.elementId === elementId && r.success)
       if (item?.result) return normalizeV1Object(item.result)
       throw new Error(`Object ${elementId} not found`)
     }
-    const raw = await this.request<Record<string, unknown>>('GET', `/objects/${encodeURIComponent(elementId)}`)
+    const raw = await this.request<Record<string, unknown>>('GET', `/objects/${encodeURIComponent(elementId)}`, undefined, signal)
     return raw as unknown as ObjectInstance
   }
 
   async getRelatedObjects(
     elementId: string,
     relationshipType?: string,
-    includeMetadata = false
+    includeMetadata = false,
+    signal?: AbortSignal
   ): Promise<ObjectInstance[]> {
     if (this.isV1()) {
       // v1: subscriptionId in body, camelCase field, bulk results response
@@ -362,7 +387,7 @@ export class I3XClient {
         elementIds: [elementId],
         relationshipType,
         includeMetadata: true
-      })
+      }, signal)
       const results = extractV1BulkResults<Array<Record<string, unknown>>>(raw)
       const objects: ObjectInstance[] = []
       for (const item of results) {
@@ -386,7 +411,7 @@ export class I3XClient {
       elementIds: [elementId],
       relationshiptype: relationshipType,
       includeMetadata
-    })
+    }, signal)
   }
 
   // Batch /objects/related — used to authoritatively determine which parents
@@ -425,10 +450,10 @@ export class I3XClient {
 
   // Value Methods (RFC 4.2.1)
 
-  async getValue(elementId: string, maxDepth = 1): Promise<LastKnownValue | null> {
+  async getValue(elementId: string, maxDepth = 1, signal?: AbortSignal): Promise<LastKnownValue | null> {
     if (this.isV1()) {
       // v1: bulk results; flat {value, quality, timestamp} in result (no data array)
-      const { data: raw, status } = await this.requestRaw<unknown>('POST', '/objects/value', { elementIds: [elementId], maxDepth })
+      const { data: raw, status } = await this.requestRawForOperation<unknown>('POST', '/objects/value', { elementIds: [elementId], maxDepth }, signal)
       // 1.0: HTTP 206 = server-imposed limit truncated the composition tree;
       // the top-level responseDetail explains the limit. Release servers only.
       const partialDetail = this.apiVersion === 'v1' && status === 206
@@ -456,7 +481,7 @@ export class I3XClient {
     }
     // v0: {elementId: {data: [{value, quality, timestamp}]}}
     const response = await this.request<Record<string, { data: Array<Record<string, unknown>> }>>(
-      'POST', '/objects/value', { elementIds: [elementId], maxDepth }
+      'POST', '/objects/value', { elementIds: [elementId], maxDepth }, signal
     )
     const entry = response[elementId]
     if (entry?.data?.[0]) {
@@ -506,7 +531,8 @@ export class I3XClient {
     elementId: string,
     startTime?: string,
     endTime?: string,
-    maxDepth = 1
+    maxDepth = 1,
+    signal?: AbortSignal
   ): Promise<HistoricalValue> {
     const defaultValue: HistoricalValue = {
       elementId,
@@ -519,7 +545,7 @@ export class I3XClient {
       // v1: bulk results; history in result.values (not data).
       // isComposition was removed from v1 history responses (spec commit 32be7d7).
       const raw = await this.request<unknown>(
-        'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }
+        'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }, signal
       )
       const results = extractV1BulkResults<{ values: Record<string, unknown>[] }>(raw)
       const item = results.find(r => r.elementId === elementId && r.success)
@@ -530,7 +556,7 @@ export class I3XClient {
     }
     // v0: {elementId: {data: [...]}}
     const response = await this.request<Record<string, { data: Record<string, unknown>[] }>>(
-      'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }
+      'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }, signal
     )
     const entry = response[elementId]
     if (entry?.data) {
