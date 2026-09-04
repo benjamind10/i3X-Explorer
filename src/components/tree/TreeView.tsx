@@ -3,6 +3,7 @@ import { useExplorerStore } from '../../stores/explorer'
 import { useConnectionStore } from '../../stores/connection'
 import { getClient } from '../../api/client'
 import type { ObjectType, ObjectInstance } from '../../api/types'
+import { captureSession, isAbortError } from '../../session'
 import { TreeNode } from './TreeNode'
 import { VirtualObjectRows } from './VirtualObjectRows'
 import {
@@ -175,18 +176,26 @@ export function TreeView() {
   const refreshTree = useCallback(async () => {
     const client = getClient()
     if (!client) return
+    const session = captureSession(client)
+    if (!session.isCurrent()) return
 
     const { expandedNodes, setNamespaces, setObjectTypes, setObjects, setHierarchicalRoots, setChildObjects } = useExplorerStore.getState()
+    const logFailure = (message: string, error: unknown, detail?: string) => {
+      if (!session.isCurrent() || isAbortError(error)) return
+      console.error(message, ...(detail ? [detail, error] : [error]))
+    }
 
     try {
       const [namespaces, objectTypes] = await Promise.all([
         client.getNamespaces(),
         client.getObjectTypes()
       ])
+      if (!session.isCurrent()) return
       setNamespaces(namespaces)
       setObjectTypes(objectTypes)
     } catch (err) {
-      console.error('Background refresh: namespaces/types failed', err)
+      logFailure('Background refresh: namespaces/types failed', err)
+      if (!session.isCurrent()) return
     }
 
     let allObjectsRefreshed = false
@@ -198,9 +207,11 @@ export function TreeView() {
         try {
           const objects = await client.getObjects(typeElementId)
           await resolveCompositionFlags(client, objects)
+          if (!session.isCurrent()) return
           setObjects(typeElementId, objects)
         } catch (err) {
-          console.error('Background refresh: type failed', typeElementId, err)
+          logFailure('Background refresh: type failed', err, typeElementId)
+          if (!session.isCurrent()) return
         }
       }
 
@@ -209,7 +220,8 @@ export function TreeView() {
         try {
           await refreshAllObjects(client, true)
         } catch (err) {
-          console.error('Background refresh: all objects failed', err)
+          logFailure('Background refresh: all objects failed', err)
+          if (!session.isCurrent()) return
         }
       }
 
@@ -217,9 +229,11 @@ export function TreeView() {
         try {
           const roots = await client.getObjects(undefined, false, true)
           await resolveCompositionFlags(client, roots)
+          if (!session.isCurrent()) return
           setHierarchicalRoots(roots)
         } catch (err) {
-          console.error('Background refresh: root objects failed', err)
+          logFailure('Background refresh: root objects failed', err)
+          if (!session.isCurrent()) return
         }
       }
 
@@ -235,9 +249,11 @@ export function TreeView() {
               child.parentId === elementId
             )
             await resolveCompositionFlags(client, compositionalChildren)
+            if (!session.isCurrent()) return
             setChildObjects(elementId, compositionalChildren)
           } catch (err) {
-            console.error('Background refresh: children failed', elementId, err)
+            logFailure('Background refresh: children failed', err, elementId)
+            if (!session.isCurrent()) return
           }
         }
       }

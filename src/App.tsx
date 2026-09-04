@@ -1,7 +1,6 @@
 import { useEffect } from 'react'
 import { useConnectionStore } from './stores/connection'
-import { useSubscriptionsStore } from './stores/subscriptions'
-import { getClient } from './api/client'
+import { endActiveSession } from './session'
 import { Toolbar } from './components/layout/Toolbar'
 import { Sidebar } from './components/layout/Sidebar'
 import { MainPanel } from './components/layout/MainPanel'
@@ -22,11 +21,7 @@ function App() {
     if (!window.electronAPI?.onAppBeforeQuit) return
     return window.electronAPI.onAppBeforeQuit(async () => {
       try {
-        const client = getClient()
-        if (client) {
-          const ids = Array.from(useSubscriptionsStore.getState().subscriptions.keys())
-          await Promise.allSettled(ids.map((id) => client.deleteSubscription(id)))
-        }
+        await endActiveSession('app-quit', 'wait')
       } finally {
         window.electronAPI?.notifyCleanupDone()
       }

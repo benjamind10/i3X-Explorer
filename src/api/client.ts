@@ -85,8 +85,12 @@ export interface StreamConfig {
 }
 
 export class I3XClient {
+  readonly sessionId: string
+  readonly signal: AbortSignal
+
   private baseUrl: string
   private credentials: ClientCredentials | null
+  private readonly sessionAbortController: AbortController
   private apiVersion: ApiVersion = 'v0'
   // Track last seen sequence number per subscription for v1 sync acknowledgment
   private syncSequenceNumbers = new Map<string, number>()
@@ -96,8 +100,19 @@ export class I3XClient {
   private capabilities: ServerCapabilities | null = null
 
   constructor(baseUrl: string, credentials?: ClientCredentials | null) {
-    this.baseUrl = baseUrl.replace(/\/$/, '')
+    this.sessionId = crypto.randomUUID()
+    this.sessionAbortController = new AbortController()
+    this.signal = this.sessionAbortController.signal
+    this.baseUrl = normalizeServerUrl(baseUrl)
     this.credentials = credentials ?? null
+  }
+
+  isActive(): boolean {
+    return !this.signal.aborted
+  }
+
+  dispose(): void {
+    if (!this.signal.aborted) this.sessionAbortController.abort()
   }
 
   getCredentials(): ClientCredentials | null {
@@ -137,7 +152,8 @@ export class I3XClient {
   private async requestRaw<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    signal: AbortSignal = this.signal
   ): Promise<{ data: T; status: number }> {
     // Fix localhost IPv6 issue - Chromium may prefer IPv6 but servers often only listen on IPv4
     let url = `${this.baseUrl}${path}`
@@ -152,7 +168,7 @@ export class I3XClient {
 
     Object.assign(headers, buildAuthHeaders(this.credentials));
 
-    const options: RequestInit = { method, headers }
+    const options: RequestInit = { method, headers, signal }
     if (body) {
       options.body = JSON.stringify(body)
     }
@@ -198,10 +214,51 @@ export class I3XClient {
   private async request<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    operationSignal?: AbortSignal
   ): Promise<T> {
-    const { data } = await this.requestRaw<T>(method, path, body)
-    return data
+    if (!operationSignal || operationSignal === this.signal) {
+      const { data } = await this.requestRaw<T>(method, path, body)
+      return data
+    }
+
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    this.signal.addEventListener('abort', abort, { once: true })
+    operationSignal.addEventListener('abort', abort, { once: true })
+    if (this.signal.aborted || operationSignal.aborted) controller.abort()
+
+    try {
+      const { data } = await this.requestRaw<T>(method, path, body, controller.signal)
+      return data
+    } finally {
+      this.signal.removeEventListener('abort', abort)
+      operationSignal.removeEventListener('abort', abort)
+    }
+  }
+
+  private async requestRawForOperation<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    operationSignal?: AbortSignal
+  ): Promise<{ data: T; status: number }> {
+    if (!operationSignal || operationSignal === this.signal) {
+      return this.requestRaw<T>(method, path, body)
+    }
+
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    this.signal.addEventListener('abort', abort, { once: true })
+    operationSignal.addEventListener('abort', abort, { once: true })
+    if (this.signal.aborted || operationSignal.aborted) controller.abort()
+
+    try {
+      return await this.requestRaw<T>(method, path, body, controller.signal)
+    } finally {
+      this.signal.removeEventListener('abort', abort)
+      operationSignal.removeEventListener('abort', abort)
+    }
   }
 
   // Detect API version by probing GET /info (v1 only). Falls back to v0.
@@ -215,7 +272,7 @@ export class I3XClient {
       const headers: Record<string, string> = { 'Accept': 'application/json' }
       Object.assign(headers, buildAuthHeaders(this.credentials));
 
-      const response = await fetch(url, { method: 'GET', headers })
+      const response = await fetch(url, { method: 'GET', headers, signal: this.signal })
 
       // If the server redirected (e.g. http → https upgrade), adopt the final URL
       // for all subsequent requests. GETs survive a 301/302 redirect but browsers
@@ -278,7 +335,12 @@ export class I3XClient {
     return this.request<RelationshipType[]>('GET', `/relationshiptypes${params}`)
   }
 
-  async getObjects(typeId?: string, includeMetadata = false, root?: boolean): Promise<ObjectInstance[]> {
+  async getObjects(
+    typeId?: string,
+    includeMetadata = false,
+    root?: boolean,
+    signal?: AbortSignal
+  ): Promise<ObjectInstance[]> {
     const params = new URLSearchParams()
     // v1 renamed the query param: typeId → typeElementId
     if (typeId) params.set(this.isV1() ? 'typeElementId' : 'typeId', typeId)
@@ -286,7 +348,7 @@ export class I3XClient {
     params.set('includeMetadata', String(this.isV1() ? true : includeMetadata))
     // v1 supports root=true server-side; v0 doesn't have this param so we filter locally below.
     if (root && this.isV1()) params.set('root', 'true')
-    const raw = await this.request<Array<Record<string, unknown>>>('GET', `/objects?${params.toString()}`)
+    const raw = await this.request<Array<Record<string, unknown>>>('GET', `/objects?${params.toString()}`, undefined, signal)
     if (this.isV1()) {
       return raw.map(normalizeV1Object)
     }
@@ -296,26 +358,27 @@ export class I3XClient {
     return all
   }
 
-  async getObject(elementId: string): Promise<ObjectInstance> {
+  async getObject(elementId: string, signal?: AbortSignal): Promise<ObjectInstance> {
     if (this.isV1()) {
       // v1: GET /objects/{id} removed; use POST /objects/list with single elementId
       const raw = await this.request<unknown>('POST', '/objects/list', {
         elementIds: [elementId],
         includeMetadata: true
-      })
+      }, signal)
       const results = extractV1BulkResults<Record<string, unknown>>(raw)
       const item = results.find(r => r.elementId === elementId && r.success)
       if (item?.result) return normalizeV1Object(item.result)
       throw new Error(`Object ${elementId} not found`)
     }
-    const raw = await this.request<Record<string, unknown>>('GET', `/objects/${encodeURIComponent(elementId)}`)
+    const raw = await this.request<Record<string, unknown>>('GET', `/objects/${encodeURIComponent(elementId)}`, undefined, signal)
     return raw as unknown as ObjectInstance
   }
 
   async getRelatedObjects(
     elementId: string,
     relationshipType?: string,
-    includeMetadata = false
+    includeMetadata = false,
+    signal?: AbortSignal
   ): Promise<ObjectInstance[]> {
     if (this.isV1()) {
       // v1: subscriptionId in body, camelCase field, bulk results response
@@ -324,7 +387,7 @@ export class I3XClient {
         elementIds: [elementId],
         relationshipType,
         includeMetadata: true
-      })
+      }, signal)
       const results = extractV1BulkResults<Array<Record<string, unknown>>>(raw)
       const objects: ObjectInstance[] = []
       for (const item of results) {
@@ -348,7 +411,7 @@ export class I3XClient {
       elementIds: [elementId],
       relationshiptype: relationshipType,
       includeMetadata
-    })
+    }, signal)
   }
 
   // Batch /objects/related — used to authoritatively determine which parents
@@ -387,10 +450,10 @@ export class I3XClient {
 
   // Value Methods (RFC 4.2.1)
 
-  async getValue(elementId: string, maxDepth = 1): Promise<LastKnownValue | null> {
+  async getValue(elementId: string, maxDepth = 1, signal?: AbortSignal): Promise<LastKnownValue | null> {
     if (this.isV1()) {
       // v1: bulk results; flat {value, quality, timestamp} in result (no data array)
-      const { data: raw, status } = await this.requestRaw<unknown>('POST', '/objects/value', { elementIds: [elementId], maxDepth })
+      const { data: raw, status } = await this.requestRawForOperation<unknown>('POST', '/objects/value', { elementIds: [elementId], maxDepth }, signal)
       // 1.0: HTTP 206 = server-imposed limit truncated the composition tree;
       // the top-level responseDetail explains the limit. Release servers only.
       const partialDetail = this.apiVersion === 'v1' && status === 206
@@ -418,7 +481,7 @@ export class I3XClient {
     }
     // v0: {elementId: {data: [{value, quality, timestamp}]}}
     const response = await this.request<Record<string, { data: Array<Record<string, unknown>> }>>(
-      'POST', '/objects/value', { elementIds: [elementId], maxDepth }
+      'POST', '/objects/value', { elementIds: [elementId], maxDepth }, signal
     )
     const entry = response[elementId]
     if (entry?.data?.[0]) {
@@ -468,7 +531,8 @@ export class I3XClient {
     elementId: string,
     startTime?: string,
     endTime?: string,
-    maxDepth = 1
+    maxDepth = 1,
+    signal?: AbortSignal
   ): Promise<HistoricalValue> {
     const defaultValue: HistoricalValue = {
       elementId,
@@ -481,7 +545,7 @@ export class I3XClient {
       // v1: bulk results; history in result.values (not data).
       // isComposition was removed from v1 history responses (spec commit 32be7d7).
       const raw = await this.request<unknown>(
-        'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }
+        'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }, signal
       )
       const results = extractV1BulkResults<{ values: Record<string, unknown>[] }>(raw)
       const item = results.find(r => r.elementId === elementId && r.success)
@@ -492,7 +556,7 @@ export class I3XClient {
     }
     // v0: {elementId: {data: [...]}}
     const response = await this.request<Record<string, { data: Record<string, unknown>[] }>>(
-      'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }
+      'POST', '/objects/history', { elementIds: [elementId], startTime, endTime, maxDepth }, signal
     )
     const entry = response[elementId]
     if (entry?.data) {
@@ -534,15 +598,35 @@ export class I3XClient {
     // subscriptions that may already be expired server-side (404), and the
     // clientId/sequence entries must not outlive the subscription locally.
     try {
-      if (this.isV1()) {
-        const clientId = this.clientIds.get(subscriptionId)
-        await this.request<unknown>('POST', '/subscriptions/delete', { clientId, subscriptionIds: [subscriptionId] })
-      } else {
-        await this.request<unknown>('DELETE', `/subscriptions/${subscriptionId}`)
-      }
+      await this.deleteSubscriptionWithSignal(subscriptionId, this.signal)
     } finally {
       this.syncSequenceNumbers.delete(subscriptionId)
       this.clientIds.delete(subscriptionId)
+    }
+  }
+
+  async deleteSubscriptionsForCleanup(ids: string[], signal: AbortSignal): Promise<void> {
+    await Promise.allSettled(ids.map(async (subscriptionId) => {
+      try {
+        await this.deleteSubscriptionWithSignal(subscriptionId, signal)
+      } finally {
+        this.syncSequenceNumbers.delete(subscriptionId)
+        this.clientIds.delete(subscriptionId)
+      }
+    }))
+  }
+
+  private async deleteSubscriptionWithSignal(subscriptionId: string, signal: AbortSignal): Promise<void> {
+    if (this.isV1()) {
+      const clientId = this.clientIds.get(subscriptionId)
+      await this.requestRaw<unknown>(
+        'POST',
+        '/subscriptions/delete',
+        { clientId, subscriptionIds: [subscriptionId] },
+        signal
+      )
+    } else {
+      await this.requestRaw<unknown>('DELETE', `/subscriptions/${subscriptionId}`, undefined, signal)
     }
   }
 
@@ -569,7 +653,7 @@ export class I3XClient {
     return this.request<unknown>('POST', `/subscriptions/${subscriptionId}/unregister`, { elementIds })
   }
 
-  async sync(subscriptionId: string): Promise<SyncResponseItem[]> {
+  async sync(subscriptionId: string, signal?: AbortSignal): Promise<SyncResponseItem[]> {
     let raw: Array<Record<string, unknown>>
 
     if (this.isV1()) {
@@ -577,17 +661,17 @@ export class I3XClient {
       // 1.0: server returns HTTP 206 when queue overflow caused update loss (partial content)
       const lastSeq = this.syncSequenceNumbers.get(subscriptionId)
       const clientId = this.clientIds.get(subscriptionId)
-      const { data, status } = await this.requestRaw<Array<Record<string, unknown>>>('POST', '/subscriptions/sync', {
+      const { data, status } = await this.requestRawForOperation<Array<Record<string, unknown>>>('POST', '/subscriptions/sync', {
         clientId,
         subscriptionId,
         ...(lastSeq !== undefined ? { lastSequenceNumber: lastSeq } : {})
-      })
+      }, signal)
       raw = data
       if (status === 206) {
         console.warn(`[i3x] sync 206: subscription ${subscriptionId} queue overflowed — some updates were dropped`)
       }
     } else {
-      raw = await this.request<Array<Record<string, unknown>>>('POST', `/subscriptions/${subscriptionId}/sync`)
+      raw = await this.request<Array<Record<string, unknown>>>('POST', `/subscriptions/${subscriptionId}/sync`, undefined, signal)
     }
 
     const items: SyncResponseItem[] = []
@@ -672,15 +756,27 @@ export class I3XClient {
 // Singleton instance
 let clientInstance: I3XClient | null = null
 
+export function normalizeServerUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/+$/, '')
+}
+
 export function getClient(): I3XClient | null {
   return clientInstance
 }
 
 export function createClient(baseUrl: string, credentials?: ClientCredentials | null): I3XClient {
+  clientInstance?.dispose()
   clientInstance = new I3XClient(baseUrl, credentials)
   return clientInstance
 }
 
-export function destroyClient(): void {
+export function destroyClient(expectedClient?: I3XClient): void {
+  if (expectedClient && clientInstance !== expectedClient) return
+  const removedClient = clientInstance
   clientInstance = null
+  removedClient?.dispose()
+}
+
+export function isCurrentClient(client: I3XClient): boolean {
+  return clientInstance === client && client.isActive()
 }

@@ -1,7 +1,8 @@
-import { useState, useCallback, useEffect, useMemo } from 'react'
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useExplorerStore } from '../../stores/explorer'
 import { useConnectionStore } from '../../stores/connection'
 import { getClient } from '../../api/client'
+import { captureSession, isAbortError } from '../../session'
 import type { HistoricalValue, ObjectInstance } from '../../api/types'
 
 interface HistoryDataPoint {
@@ -45,6 +46,9 @@ export function HistoryPanel() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [hasLoaded, setHasLoaded] = useState(false)
+  const latestRequestRef = useRef(0)
+  const requestControllerRef = useRef<AbortController | null>(null)
+  const loadedRangeRef = useRef<string | null>(null)
 
   // Timespan selection state
   const [selectedTimespan, setSelectedTimespan] = useState<TimespanPreset>('1h')
@@ -53,6 +57,7 @@ export function HistoryPanel() {
 
   const selectedItem = useExplorerStore((state) => state.selectedItem)
   const isConnected = useConnectionStore((state) => state.isConnected)
+  const sessionGeneration = useConnectionStore((state) => state.sessionGeneration)
 
   const isObjectSelected = selectedItem?.type === 'object'
   // Use the elementId from the data object directly (like ObjectDetail does),
@@ -61,46 +66,73 @@ export function HistoryPanel() {
     ? (selectedItem.data as ObjectInstance).elementId
     : null
 
-  // Clear history when selection changes or connection state changes
   useEffect(() => {
+    latestRequestRef.current++
+    requestControllerRef.current?.abort()
+    requestControllerRef.current = null
+    loadedRangeRef.current = null
     setHistoryData([])
     setError(null)
     setHasLoaded(false)
-  }, [selectedElementId, isConnected])
+    setIsLoading(false)
+    return () => {
+      latestRequestRef.current++
+      requestControllerRef.current?.abort()
+      requestControllerRef.current = null
+    }
+  }, [selectedElementId, isConnected, sessionGeneration])
 
   const fetchHistory = useCallback(async () => {
     if (!isObjectSelected || !selectedElementId || !isConnected) return
 
+    let startTime: string
+    let endTime: string
+    const rangeKey = selectedTimespan === 'custom'
+      ? `custom:${customStartTime}:${customEndTime}`
+      : selectedTimespan
+
+    if (selectedTimespan === 'custom') {
+      if (!customStartTime || !customEndTime) {
+        setError('Please select both start and end times')
+        return
+      }
+      startTime = new Date(customStartTime).toISOString()
+      endTime = new Date(customEndTime).toISOString()
+    } else {
+      const preset = TIMESPAN_OPTIONS.find(o => o.value === selectedTimespan)
+      const ms = preset?.ms ?? 60 * 60 * 1000
+      endTime = new Date().toISOString()
+      startTime = new Date(Date.now() - ms).toISOString()
+    }
+
     const client = getClient()
     if (!client) return
 
+    requestControllerRef.current?.abort()
+    const controller = new AbortController()
+    requestControllerRef.current = controller
+    const requestId = ++latestRequestRef.current
+    const session = captureSession(client)
+    const isCurrent = () => session.isCurrent() && requestId === latestRequestRef.current
+    const retainContent = loadedRangeRef.current === rangeKey
+
+    if (!retainContent) {
+      setHistoryData([])
+      setHasLoaded(false)
+    }
     setIsLoading(true)
     setError(null)
 
     try {
-      let startTime: string
-      let endTime: string
-
-      if (selectedTimespan === 'custom') {
-        if (!customStartTime || !customEndTime) {
-          setError('Please select both start and end times')
-          setIsLoading(false)
-          return
-        }
-        startTime = new Date(customStartTime).toISOString()
-        endTime = new Date(customEndTime).toISOString()
-      } else {
-        const preset = TIMESPAN_OPTIONS.find(o => o.value === selectedTimespan)
-        const ms = preset?.ms ?? 60 * 60 * 1000
-        endTime = new Date().toISOString()
-        startTime = new Date(Date.now() - ms).toISOString()
-      }
 
       const result: HistoricalValue = await client.getHistory(
         selectedElementId,
         startTime,
-        endTime
+        endTime,
+        1,
+        controller.signal
       )
+      if (!isCurrent()) return
 
       // Extract data points from response.
       // Null/undefined values must be preserved for trend charts.
@@ -124,14 +156,19 @@ export function HistoryPanel() {
       points.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
       setHistoryData(points)
       setHasLoaded(true)
+      loadedRangeRef.current = rangeKey
       if (isCollapsed) setIsCollapsed(false)
     } catch (err) {
+      if (isAbortError(err) || !isCurrent()) return
       setError(err instanceof Error ? err.message : 'Failed to fetch history')
-      setHistoryData([])
+      if (!retainContent) setHistoryData([])
     } finally {
-      setIsLoading(false)
+      if (isCurrent()) {
+        if (requestControllerRef.current === controller) requestControllerRef.current = null
+        setIsLoading(false)
+      }
     }
-  }, [selectedElementId, isObjectSelected, isConnected, isCollapsed, selectedTimespan, customStartTime, customEndTime])
+  }, [selectedElementId, isObjectSelected, isConnected, isCollapsed, selectedTimespan, customStartTime, customEndTime, sessionGeneration])
 
   const handleMouseDown = useCallback(() => {
     if (isCollapsed) return
@@ -210,7 +247,7 @@ export function HistoryPanel() {
           </span>
         )}
         {isLoading && (
-          <span className="text-xs text-i3x-text-muted">Loading...</span>
+          <span className="text-xs text-i3x-text-muted">{historyData.length > 0 ? 'Updating...' : 'Loading...'}</span>
         )}
       </div>
 
@@ -220,6 +257,11 @@ export function HistoryPanel() {
           <div className="flex-1 overflow-auto p-3">
             {error && (
               <p className="text-xs text-i3x-error">{error}</p>
+            )}
+            {!error && historyData.length === 0 && isLoading && (
+              <div role="status" className="flex items-center justify-center h-24 text-xs text-i3x-text-muted">
+                Loading history...
+              </div>
             )}
             {!error && historyData.length === 0 && !isLoading && (
               <div className="flex flex-col gap-3">
@@ -239,7 +281,7 @@ export function HistoryPanel() {
                       </select>
                       <button
                         onClick={fetchHistory}
-                        disabled={selectedTimespan === 'custom' && (!customStartTime || !customEndTime)}
+                        disabled={isLoading || (selectedTimespan === 'custom' && (!customStartTime || !customEndTime))}
                         className="px-3 py-1 text-xs bg-i3x-primary text-white rounded hover:bg-i3x-primary/80 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         Load History
@@ -309,7 +351,7 @@ export function HistoryPanel() {
                     disabled={isLoading || (selectedTimespan === 'custom' && (!customStartTime || !customEndTime))}
                     className="px-3 py-1 text-xs bg-i3x-primary text-white rounded hover:bg-i3x-primary/80 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    {isLoading ? 'Loading...' : 'Reload'}
+                    {isLoading ? 'Updating...' : 'Reload'}
                   </button>
                 </div>
                 {dataType === 'numeric' && <HistoryTrendChart data={historyData} />}

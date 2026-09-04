@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useExplorerStore } from '../../stores/explorer'
 import { getClient } from '../../api/client'
 import type { ObjectInstance } from '../../api/types'
+import { useConnectionStore } from '../../stores/connection'
+import { captureSession, isAbortError, type SessionContext } from '../../session'
 
 interface SearchResult {
   object: ObjectInstance
@@ -33,9 +35,15 @@ export function SearchModal({ onClose }: SearchModalProps) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [activeIndex, setActiveIndex] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const searchRequestIdRef = useRef(0)
+  const searchAbortRef = useRef<AbortController | null>(null)
+  const navigationRequestIdRef = useRef(0)
+  const navigationAbortRef = useRef<AbortController | null>(null)
+  const sessionGeneration = useConnectionStore(state => state.sessionGeneration)
 
   const { selectItem, setAllObjects, setHierarchicalRoots, objectTypes } = useExplorerStore()
   const typeIndex = useMemo(() => new Map(objectTypes.map(t => [t.elementId, t])), [objectTypes])
@@ -56,27 +64,34 @@ export function SearchModal({ onClose }: SearchModalProps) {
     active?.scrollIntoView({ block: 'nearest' })
   }, [activeIndex])
 
-  const performSearch = useCallback(async (searchQuery: string) => {
-    if (!searchQuery.trim()) {
-      setResults([])
-      return
-    }
-
-    const client = getClient()
-    if (!client) return
-
+  const performSearch = useCallback(async (
+    searchQuery: string,
+    requestId: number,
+    controller: AbortController,
+    session: SessionContext
+  ) => {
+    const isCurrent = () => (
+      session.isCurrent()
+      && requestId === searchRequestIdRef.current
+      && searchAbortRef.current === controller
+      && !controller.signal.aborted
+    )
+    if (!isCurrent()) return
     setIsLoading(true)
+    setError(null)
     try {
       // Use cached store values; fetch if not yet loaded
       let objects = useExplorerStore.getState().allObjects
       let roots = useExplorerStore.getState().hierarchicalRoots
 
       if (objects.length === 0) {
-        objects = await client.getObjects()
+        objects = await session.client.getObjects(undefined, false, undefined, controller.signal)
+        if (!isCurrent()) return
         setAllObjects(objects)
       }
       if (roots.length === 0) {
-        roots = await client.getObjects(undefined, false, true)
+        roots = await session.client.getObjects(undefined, false, true, controller.signal)
+        if (!isCurrent()) return
         setHierarchicalRoots(roots)
       }
 
@@ -107,56 +122,114 @@ export function SearchModal({ onClose }: SearchModalProps) {
         return aLabel.localeCompare(bLabel)
       })
 
-      setResults(searchResults)
-      setActiveIndex(0)
+      if (isCurrent()) {
+        setResults(searchResults)
+        setActiveIndex(0)
+      }
+    } catch (err) {
+      if (isCurrent() && !isAbortError(err)) {
+        setResults([])
+        setError(err instanceof Error ? err.message : 'Search failed')
+      }
     } finally {
-      setIsLoading(false)
+      if (isCurrent()) setIsLoading(false)
     }
   }, [setAllObjects, setHierarchicalRoots])
 
   useEffect(() => {
-    const timer = setTimeout(() => performSearch(query), 250)
-    return () => clearTimeout(timer)
-  }, [query, performSearch])
+    const requestId = ++searchRequestIdRef.current
+    searchAbortRef.current?.abort()
+    navigationRequestIdRef.current++
+    navigationAbortRef.current?.abort()
+    setError(null)
+    setIsLoading(false)
+    setResults([])
+    setActiveIndex(0)
+
+    if (!query.trim()) {
+      return
+    }
+
+    const client = getClient()
+    if (!client) {
+      return
+    }
+
+    const controller = new AbortController()
+    const session = captureSession(client)
+    searchAbortRef.current = controller
+    const timer = setTimeout(() => {
+      void performSearch(query, requestId, controller, session)
+    }, 250)
+    return () => {
+      clearTimeout(timer)
+      controller.abort()
+    }
+  }, [query, sessionGeneration, performSearch])
+
+  useEffect(() => () => {
+    navigationRequestIdRef.current++
+    navigationAbortRef.current?.abort()
+  }, [])
 
   const navigateTo = useCallback(async (result: SearchResult) => {
     const client = getClient()
     if (!client) return
 
-    const { expandedNodes } = useExplorerStore.getState()
-    const newExpanded = new Set(expandedNodes)
+    const requestId = ++navigationRequestIdRef.current
+    navigationAbortRef.current?.abort()
+    const controller = new AbortController()
+    navigationAbortRef.current = controller
+    const session = captureSession(client)
+    const isCurrent = () => (
+      session.isCurrent()
+      && requestId === navigationRequestIdRef.current
+      && navigationAbortRef.current === controller
+      && !controller.signal.aborted
+    )
+    if (!isCurrent()) return
 
-    if (result.useHierarchy) {
-      // Ensure roots are loaded so the Hierarchy folder renders correctly
-      let roots = useExplorerStore.getState().hierarchicalRoots
-      if (roots.length === 0) {
-        roots = await client.getObjects(undefined, false, true)
-        setHierarchicalRoots(roots)
+    try {
+      const { expandedNodes } = useExplorerStore.getState()
+      const newExpanded = new Set(expandedNodes)
+
+      if (result.useHierarchy) {
+        // Ensure roots are loaded so the Hierarchy folder renders correctly
+        let roots = useExplorerStore.getState().hierarchicalRoots
+        if (roots.length === 0) {
+          roots = await client.getObjects(undefined, false, true, controller.signal)
+          if (!isCurrent()) return
+          setHierarchicalRoots(roots)
+        }
+
+        newExpanded.add('folder:hierarchical')
+
+        // Expand every ancestor in the parentId chain so the target node is visible
+        const objects = useExplorerStore.getState().allObjects
+        const visited = new Set<string>()
+        let current = result.object
+        while (current.parentId && current.parentId !== '/' && !visited.has(current.elementId)) {
+          visited.add(current.elementId)
+          const parent = objects.find(o => o.elementId === current.parentId)
+          if (!parent) break
+          newExpanded.add(`hier:${parent.elementId}`)
+          current = parent
+        }
+
+        if (!isCurrent()) return
+        useExplorerStore.setState({ expandedNodes: newExpanded })
+        selectItem({ type: 'object', id: `hier:${result.object.elementId}`, data: result.object })
+      } else {
+        newExpanded.add('folder:objects')
+        if (!isCurrent()) return
+        useExplorerStore.setState({ expandedNodes: newExpanded })
+        selectItem({ type: 'object', id: `obj:${result.object.elementId}`, data: result.object })
       }
 
-      newExpanded.add('folder:hierarchical')
-
-      // Expand every ancestor in the parentId chain so the target node is visible
-      const objects = useExplorerStore.getState().allObjects
-      const visited = new Set<string>()
-      let current = result.object
-      while (current.parentId && current.parentId !== '/' && !visited.has(current.elementId)) {
-        visited.add(current.elementId)
-        const parent = objects.find(o => o.elementId === current.parentId)
-        if (!parent) break
-        newExpanded.add(`hier:${parent.elementId}`)
-        current = parent
-      }
-
-      useExplorerStore.setState({ expandedNodes: newExpanded })
-      selectItem({ type: 'object', id: `hier:${result.object.elementId}`, data: result.object })
-    } else {
-      newExpanded.add('folder:objects')
-      useExplorerStore.setState({ expandedNodes: newExpanded })
-      selectItem({ type: 'object', id: `obj:${result.object.elementId}`, data: result.object })
+      if (isCurrent()) onClose()
+    } catch (err) {
+      if (isCurrent() && !isAbortError(err)) console.error('Failed to navigate to search result:', err)
     }
-
-    onClose()
   }, [selectItem, setHierarchicalRoots, onClose])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -257,7 +330,7 @@ export function SearchModal({ onClose }: SearchModalProps) {
         {/* Empty state */}
         {query && !isLoading && results.length === 0 && (
           <div className="px-4 py-8 text-center text-sm text-i3x-text-muted">
-            No objects found matching "{query}"
+            {error ?? `No objects found matching "${query}"`}
           </div>
         )}
 

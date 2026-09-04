@@ -74,6 +74,7 @@ interface ConnectionState {
   showConnectionDialog: boolean
   recentUrls: string[]
   ignoreCertErrors: boolean
+  sessionGeneration: number
 
   setServerUrl: (url: string) => void
   setCredentials: (credentials: Credentials | null) => void
@@ -85,6 +86,7 @@ interface ConnectionState {
   setShowConnectionDialog: (show: boolean) => void
   addRecentUrl: (url: string) => void
   setIgnoreCertErrors: (ignore: boolean) => void
+  invalidateSession: () => void
   disconnect: () => void
 }
 
@@ -100,6 +102,7 @@ export const useConnectionStore = create<ConnectionState>()(
       showConnectionDialog: false,
       recentUrls: ['https://api.i3x.dev/v1', 'http://localhost:8080'],
       ignoreCertErrors: false,
+      sessionGeneration: 0,
 
       setServerUrl: (url) => set({ serverUrl: url }),
       setCredentials: (credentials) => set({ credentials }),
@@ -124,6 +127,7 @@ export const useConnectionStore = create<ConnectionState>()(
       setError: (error) => set({ error, isConnecting: false }),
       setShowConnectionDialog: (show) => set({ showConnectionDialog: show }),
       setIgnoreCertErrors: (ignore) => set({ ignoreCertErrors: ignore }),
+      invalidateSession: () => set(state => ({ sessionGeneration: state.sessionGeneration + 1 })),
 
       addRecentUrl: (url) => {
         const { recentUrls } = get()
